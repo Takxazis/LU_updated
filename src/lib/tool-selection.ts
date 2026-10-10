@@ -13,6 +13,52 @@ interface ToolGroup {
   tools: string[]
 }
 
+
+/**
+ * Match routing words at real alphanumeric boundaries.
+ *
+ * The old substring matcher made `latest` match `test`, and `this project`
+ * match `this pr`. Phrases still match inside a sentence, but neither edge may
+ * be buried inside a larger word. Deliberate fragments keep substring
+ * semantics explicitly instead of making every keyword fuzzy.
+ */
+const SUBSTRING_ROUTING_KEYWORDS = new Set([
+  'http://', 'https://', '/pull/', '/resume',
+  // German morphological stems used intentionally by the existing catalog.
+  'recherch', 'animier',
+])
+
+function escapeRoutingKeyword(keyword: string): string {
+  return keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function keywordMatches(message: string, keyword: string): boolean {
+  if (SUBSTRING_ROUTING_KEYWORDS.has(keyword)) return message.includes(keyword)
+  const escaped = escapeRoutingKeyword(keyword)
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'u').test(message)
+}
+
+/**
+ * Natural English freshness/source requests whose meaningful words are not
+ * adjacent, e.g. "find the latest stable Godot version online". Bare words
+ * such as `online`, `latest`, `current` and `official` are deliberately not
+ * enough: coding requests commonly contain them without asking for the web.
+ */
+function wantsNaturalEnglishWeb(message: string): boolean {
+  const localCodeContext = /\b(?:local|project|codebase|repository|repo|file|changes?)\b/.test(message)
+  if (localCodeContext) return false
+
+  const retrieval = /\b(?:find|check|locate|open|look\s+for|get)\b/.test(message)
+  const freshness = /\b(?:latest|current|newest|recent|stable)\b/.test(message)
+  const releaseSubject = /\b(?:version|release|update|information|info)\b/.test(message)
+  const explicitSource = /\b(?:online|official\s+(?:source|site|website|page))\b/.test(message)
+
+  return retrieval && (
+    (freshness && releaseSubject) ||
+    (explicitSource && (freshness || releaseSubject))
+  )
+}
+
 // Creative image/video. Surface BOTH generators for any creative request so
 // the model can chain image → video in one conversation (David: "ein Video
 // aus dem Bild soll die LLM auch machen können"). Without video_generate
@@ -292,8 +338,14 @@ export function selectRelevantTools(
   // "erklaer mir das mal" nicht mehr zu unterscheiden. Genau daran hing der
   // Fehler, den dieser Block behebt.
   let lokaleArbeit = false
+  if (wantsNaturalEnglishWeb(msg)) {
+    for (const name of ['web_search', 'web_fetch']) {
+      selectedNames.add(name)
+      keywordNames.add(name)
+    }
+  }
   for (const group of TOOL_GROUPS) {
-    if (group.keywords.some(kw => msg.includes(kw))) {
+    if (group.keywords.some(kw => keywordMatches(msg, kw))) {
       if (group.tools.some(t => LOKALE_WERKZEUGE.has(t))) lokaleArbeit = true
       group.tools.forEach((t) => {
         selectedNames.add(t)
@@ -470,7 +522,7 @@ export function gateCreateTools<T extends { name: string }>(
     if (!words) return true
     if (reopened?.has(t.name)) return true
     if (msg.includes(t.name)) return true
-    return words.some((k) => msg.includes(k))
+    return words.some(k => keywordMatches(msg, k))
   })
 }
 
@@ -479,7 +531,7 @@ export function gateCreateTools<T extends { name: string }>(
 export function wantsMediaTools(userMessage: string): boolean {
   const msg = userMessage.toLowerCase()
   return (
-    MEDIA_KEYWORDS.some((k) => msg.includes(k)) ||
+    MEDIA_KEYWORDS.some(k => keywordMatches(msg, k)) ||
     msg.includes('image_generate') ||
     msg.includes('video_generate')
   )
