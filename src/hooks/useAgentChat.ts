@@ -60,7 +60,7 @@ import { extractMemoriesFromPair } from './useMemory'
 import { useAgentWorkflowStore } from '../stores/agentWorkflowStore'
 import { WorkflowEngine, describeWorkflowCompletion, describeWorkflowStepFailure } from '../lib/workflow-engine'
 import type { AgentBlock, AgentToolCall } from '../types/agent-mode'
-import { selectRelevantToolsAsync, toolSelectionOpts, ALWAYS_INCLUDE } from '../lib/tool-selection'
+import { selectRelevantToolsAsync, toolSelectionOpts, ALWAYS_INCLUDE, gateCreateTools, isGatedTool } from '../lib/tool-selection'
 import { renderToolRoster, renderToolNames } from '../lib/tool-roster'
 import { MUTATING_TOOLS, allowedInReadOnlyTurn } from '../lib/mutating-tools'
 import { resolveApprovalLevel } from '../lib/agent-approval-policy'
@@ -1262,6 +1262,10 @@ export function useAgentChat() {
     let visionFeedbackGiven = false
     let mediaSteered = false
     let mediaSynthesized = false
+    // Parity with useCodex: specialized/expensive tools stay behind their
+    // existing intent gate, but a real blind call opens the gate for the rest
+    // of this run. Run-scoped, never shared across conversations.
+    let createGateOpened = false
     let forceNoThink = false
     let dudRetried = false
     // Z36 finding 3: one corrective steer for a final answer citing links no
@@ -1544,12 +1548,19 @@ export function useAgentChat() {
           // Als sie hier standen, gab es sie nur an DIESER Stelle — der
           // hermes_xml-Zweig oben nahm stattdessen den ganzen Katalog, und
           // niemandem fiel es auf, weil nichts brach.
-          const relevantDefs = await selectRelevantToolsAsync(
+          const routedDefs = await selectRelevantToolsAsync(
             lastUserMsg,
             toolRegistry.getAll().filter((t) => toolMatchesCurated(t.name)),
             permissions,
             toolSelectionOpts(!!settings.smallModelMode, (texts) => generateEmbeddings(texts)),
           )
+          // The Hermes catalog is embedded in the run's system message before
+          // the loop and is intentionally unchanged in this first parity pass.
+          // Native transports can apply the same final gate as useCodex without
+          // rebuilding goal/workspace/persona/RAG/clock prompt suffixes.
+          const relevantDefs = strategy === 'hermes_xml'
+            ? routedDefs
+            : gateCreateTools(routedDefs, lastUserMsg, createGateOpened)
           const tools: ToolDefinition[] = relevantDefs.map(t => ({
             type: 'function' as const,
             function: { name: t.name, description: t.description, parameters: t.inputSchema },
@@ -2448,8 +2459,12 @@ export function useAgentChat() {
           // Timeout backstop shared with Codex (audit B9): before this the
           // Agent loop had NO ceiling around a tool call, so one hung tool
           // wedged the whole run with no way out but a restart.
-          execute: (name: string, args: ToolArgs, callRun?: AgentRunContext, signal?: AbortSignal) =>
-            raceWithToolTimeout(
+          execute: (name: string, args: ToolArgs, callRun?: AgentRunContext, signal?: AbortSignal) => {
+            // Same self-heal as useCodex. A model may call a gated tool by name
+            // from the full capability roster even when its schema was omitted
+            // for this step; run it, then openly carry gated schemas afterward.
+            if (isGatedTool(name)) createGateOpened = true
+            return raceWithToolTimeout(
               name,
               toolCallCapMs(name, args, settings),
               // The run's Stop travels into the tool itself (audit M1), not
@@ -2458,7 +2473,8 @@ export function useAgentChat() {
               // call is cancelled for real instead of left running orphaned.
               (raced) => toolRegistry.execute(name, args, 1, callRun, raced),
               signal ?? abort.signal,
-            ),
+            )
+          },
           lookupCache: convId ? makeInTurnCacheLookup({ convId, turnStartMs }) : undefined,
           explainError: (toolName, err) => explainToolError(toolName, err),
           awaitApproval: async (req) => {
