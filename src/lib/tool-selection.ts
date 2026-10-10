@@ -252,6 +252,16 @@ export const EMBEDDING_ROUTING_THRESHOLD = 15
 import type { EmbeddingFn, SemanticToolRank } from '../api/agents/embedding-router'
 import { selectToolsByEmbedding } from '../api/agents/embedding-router'
 
+export interface DeterministicToolProvenance {
+  always_include_names: string[]
+  keyword_names: string[]
+  external_names: string[]
+  verbatim_names: string[]
+  fallback_names: string[]
+  safety_names: string[]
+  deterministic_names: string[]
+}
+
 /**
  * Select relevant tools based on user message content.
  * Returns a filtered list of tool names.
@@ -261,9 +271,15 @@ export function selectRelevantTools(
   allTools: MCPToolDefinition[],
   permissions: PermissionMap,
   maxTools?: number,
+  onProvenance?: (provenance: DeterministicToolProvenance) => void,
 ): MCPToolDefinition[] {
   const msg = userMessage.toLowerCase()
   const selectedNames = new Set<string>(ALWAYS_INCLUDE)
+  const keywordNames = new Set<string>()
+  const externalNames = new Set<string>()
+  const verbatimNames = new Set<string>()
+  const fallbackNames = new Set<string>()
+  const safetyNames = new Set<string>()
 
   // Match tool groups by keywords
   //
@@ -279,7 +295,10 @@ export function selectRelevantTools(
   for (const group of TOOL_GROUPS) {
     if (group.keywords.some(kw => msg.includes(kw))) {
       if (group.tools.some(t => LOKALE_WERKZEUGE.has(t))) lokaleArbeit = true
-      group.tools.forEach(t => selectedNames.add(t))
+      group.tools.forEach((t) => {
+        selectedNames.add(t)
+        keywordNames.add(t)
+      })
     }
   }
 
@@ -288,12 +307,18 @@ export function selectRelevantTools(
   // unreachable no matter what the user typed. Connecting the server is
   // itself the signal that its tools are wanted: always offer them.
   for (const t of allTools) {
-    if (t.source === 'external') selectedNames.add(t.name)
+    if (t.source === 'external') {
+      selectedNames.add(t.name)
+      externalNames.add(t.name)
+    }
   }
 
   // A tool the user names verbatim is always offered, builtin or external.
   for (const t of allTools) {
-    if (msg.includes(t.name.toLowerCase())) selectedNames.add(t.name)
+    if (msg.includes(t.name.toLowerCase())) {
+      selectedNames.add(t.name)
+      verbatimNames.add(t.name)
+    }
   }
 
   // If nothing beyond the always-included tools matched, include a broad set
@@ -302,9 +327,10 @@ export function selectRelevantTools(
   // (e.g. file_edit) doesn't silently disable this fallback.
   if (selectedNames.size <= ALWAYS_INCLUDE.length) {
     // Include common tools for generic requests
-    selectedNames.add('shell_execute')
-    selectedNames.add('file_list')
-    selectedNames.add('file_search')
+    for (const name of ['shell_execute', 'file_list', 'file_search']) {
+      selectedNames.add(name)
+      fallbackNames.add(name)
+    }
     // Web nur fuer Nachrichten, die NICHT erkennbar vom Projekt handeln — und
     // dann als PAAR. Beide Haelften dieser Bedingung sind gemessen:
     //
@@ -329,6 +355,8 @@ export function selectRelevantTools(
     if (!lokaleArbeit) {
       selectedNames.add('web_search')
       selectedNames.add('web_fetch')
+      fallbackNames.add('web_search')
+      fallbackNames.add('web_fetch')
     }
   }
 
@@ -344,9 +372,10 @@ export function selectRelevantTools(
     selectedNames.has('file_search') ||
     selectedNames.has('file_list')
   if (hasCodeSignal) {
-    selectedNames.add('shell_execute')
-    selectedNames.add('file_list')
-    selectedNames.add('file_search')
+    for (const name of ['shell_execute', 'file_list', 'file_search']) {
+      if (!selectedNames.has(name)) safetyNames.add(name)
+      selectedNames.add(name)
+    }
   }
 
   // Das Web-Paar bleibt zusammen — die zweite Sicherung.
@@ -360,7 +389,10 @@ export function selectRelevantTools(
   // NUR in diese Richtung: web_fetch kommt zu web_search, nicht umgekehrt. Wer
   // eine URL hat, braucht keine Suche, und unter dem Small-Model-Deckel kostet
   // jedes ungefragte Werkzeug einen von zwei freien Plaetzen.
-  if (selectedNames.has('web_search')) selectedNames.add('web_fetch')
+  if (selectedNames.has('web_search')) {
+    if (!selectedNames.has('web_fetch')) safetyNames.add('web_fetch')
+    selectedNames.add('web_fetch')
+  }
 
   // Filter by permissions (blocked categories excluded)
   const available = allTools.filter(t => permissions[t.category] !== 'blocked')
@@ -368,12 +400,35 @@ export function selectRelevantTools(
   // Return only selected tools that are available
   const selected = available.filter(t => selectedNames.has(t.name))
 
+  const emitProvenance = (final: MCPToolDefinition[]) => {
+    if (!onProvenance) return
+    const availableNames = new Set(available.map((t) => t.name))
+    const finalNames = new Set(final.map((t) => t.name))
+    const visible = (names: Iterable<string>) =>
+      [...names].filter((name) => availableNames.has(name))
+    onProvenance({
+      always_include_names: visible(ALWAYS_INCLUDE),
+      keyword_names: visible(keywordNames),
+      external_names: visible(externalNames),
+      verbatim_names: visible(verbatimNames),
+      fallback_names: visible(fallbackNames),
+      safety_names: visible(safetyNames),
+      deterministic_names: [...finalNames],
+    })
+  }
+
   // Safety: if nothing matched at all, return all available tools
-  if (selected.length === 0) return applyMaxTools(available, maxTools)
+  if (selected.length === 0) {
+    const final = applyMaxTools(available, maxTools)
+    emitProvenance(final)
+    return final
+  }
 
   // Small-Model Mode (Knob 1): cap the catalog when maxTools is set. No-op
   // (returns `selected` unchanged) when unset — default behaviour preserved.
-  return applyMaxTools(selected, maxTools, undefined, mentionedToolNames(userMessage, allTools))
+  const final = applyMaxTools(selected, maxTools, undefined, mentionedToolNames(userMessage, allTools))
+  emitProvenance(final)
+  return final
 }
 
 /**
@@ -524,6 +579,7 @@ export interface ToolSelectionOptions {
   topN?: number
   maxTools?: number
   onSemanticRank?: (ranked: SemanticToolRank[]) => void
+  onDeterministicProvenance?: (provenance: DeterministicToolProvenance) => void
 }
 
 export function toolSelectionOpts(
@@ -550,7 +606,18 @@ export async function selectRelevantToolsAsync(
   const available = allTools.filter((t) => permissions[t.category] !== 'blocked')
   const pinned = mentionedToolNames(userMessage, available)
   if (!opts?.embed || available.length <= threshold) {
-    return applyMaxTools(selectRelevantTools(userMessage, allTools, permissions), opts?.maxTools, undefined, pinned)
+    return applyMaxTools(
+      selectRelevantTools(
+        userMessage,
+        allTools,
+        permissions,
+        undefined,
+        opts?.onDeterministicProvenance,
+      ),
+      opts?.maxTools,
+      undefined,
+      pinned,
+    )
   }
   try {
     const semanticNames = await selectToolsByEmbedding(
@@ -563,7 +630,13 @@ export async function selectRelevantToolsAsync(
         onRanked: opts.onSemanticRank,
       },
     )
-    const keyword = selectRelevantTools(userMessage, allTools, permissions)
+    const keyword = selectRelevantTools(
+      userMessage,
+      allTools,
+      permissions,
+      undefined,
+      opts.onDeterministicProvenance,
+    )
     const union = new Set<string>([...semanticNames, ...keyword.map((t) => t.name)])
     const selected = available.filter((t) => union.has(t.name))
     // Small-Model Mode (Knob 1): cap the union to maxTools, filling from
@@ -573,6 +646,17 @@ export async function selectRelevantToolsAsync(
     // tools are pinned past the cap on both paths.
     return applyMaxTools(selected, opts.maxTools, semanticNames, pinned)
   } catch {
-    return applyMaxTools(selectRelevantTools(userMessage, allTools, permissions), opts?.maxTools, undefined, pinned)
+    return applyMaxTools(
+      selectRelevantTools(
+        userMessage,
+        allTools,
+        permissions,
+        undefined,
+        opts?.onDeterministicProvenance,
+      ),
+      opts?.maxTools,
+      undefined,
+      pinned,
+    )
   }
 }

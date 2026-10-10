@@ -120,6 +120,33 @@ describe('tool-selection — selectRelevantToolsAsync', () => {
     expect(seen).not.toHaveBeenCalled()
   })
 
+  it('reports deterministic rule provenance from the real router', async () => {
+    const tools = [
+      mkTool('file_read', 'read a file', 'filesystem'),
+      mkTool('file_write', 'write a file', 'filesystem'),
+      mkTool('file_edit', 'edit a file', 'filesystem'),
+      mkTool('todo_write', 'write a plan', 'system'),
+      mkTool('file_list', 'list files', 'filesystem'),
+      mkTool('file_search', 'search files', 'filesystem'),
+      mkTool('shell_execute', 'run commands', 'terminal'),
+      mkTool('web_search', 'search online', 'web'),
+      mkTool('web_fetch', 'read a URL', 'web'),
+      { ...mkTool('external_tool', 'external capability', 'workflow'), source: 'external' as const, serverId: 'srv' },
+    ]
+    let seen: import('../tool-selection').DeterministicToolProvenance | undefined
+    await selectRelevantToolsAsync('search file package.json and use external_tool', tools, fullPerms, {
+      embed: fakeEmbed,
+      embeddingThreshold: 99,
+      onDeterministicProvenance: (provenance) => { seen = provenance },
+    })
+    expect(seen).toBeDefined()
+    expect(seen!.always_include_names).toEqual(expect.arrayContaining(['file_read', 'file_write', 'file_edit', 'todo_write']))
+    expect(seen!.external_names).toEqual(['external_tool'])
+    expect(seen!.verbatim_names).toEqual(['external_tool'])
+    expect(seen!.keyword_names).toContain('file_search')
+    expect(seen!.deterministic_names).toEqual(expect.arrayContaining(['external_tool', 'file_search']))
+  })
+
   it('embed failure falls back silently to keyword', async () => {
     const tools = Array.from({ length: 20 }, (_, i) =>
       mkTool(`t${i}`, `desc ${i}`, 'filesystem')

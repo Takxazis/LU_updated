@@ -1549,11 +1549,23 @@ export function useAgentChat() {
           // hermes_xml-Zweig oben nahm stattdessen den ganzen Katalog, und
           // niemandem fiel es auf, weil nichts brach.
           let semanticRank: Array<{ name: string; score: number }> = []
+          let deterministicProvenance = {
+            always_include_names: [] as string[],
+            keyword_names: [] as string[],
+            external_names: [] as string[],
+            verbatim_names: [] as string[],
+            fallback_names: [] as string[],
+            safety_names: [] as string[],
+            deterministic_names: [] as string[],
+          }
           const selectionOpts = toolSelectionOpts(
             !!settings.smallModelMode,
             (texts) => generateEmbeddings(texts),
           )
           selectionOpts.onSemanticRank = (ranked) => { semanticRank = ranked }
+          selectionOpts.onDeterministicProvenance = (provenance) => {
+            deterministicProvenance = provenance
+          }
           const availableDefs = toolRegistry.getAll().filter((t) => toolMatchesCurated(t.name))
           const routedDefs = await selectRelevantToolsAsync(
             lastUserMsg,
@@ -1573,6 +1585,16 @@ export function useAgentChat() {
             function: { name: t.name, description: t.description, parameters: t.inputSchema },
           }))
           const selectedNames = new Set(relevantDefs.map((t) => t.name))
+          const deterministicOriginNames = new Set([
+            ...deterministicProvenance.always_include_names,
+            ...deterministicProvenance.keyword_names,
+            ...deterministicProvenance.external_names,
+            ...deterministicProvenance.verbatim_names,
+            ...deterministicProvenance.fallback_names,
+            ...deterministicProvenance.safety_names,
+          ])
+          const semanticNames = semanticRank.map((entry) => entry.name)
+          const semanticOnlyNames = semanticNames.filter((name) => !deterministicOriginNames.has(name))
           log.warn('agent.tool_selection_measurement', {
             event: 'agent_tool_selection_measurement',
             provider: providerId,
@@ -1581,6 +1603,10 @@ export function useAgentChat() {
             step: stepNo,
             available_count: availableDefs.length,
             semantic_rank: semanticRank,
+            semantic_names: semanticNames,
+            semantic_only_names: semanticOnlyNames,
+            selected_semantic_only_names: semanticOnlyNames.filter((name) => selectedNames.has(name)),
+            ...deterministicProvenance,
             routed_names: routedDefs.map((t) => t.name),
             gated_out: routedDefs.filter((t) => !selectedNames.has(t.name)).map((t) => t.name),
             selected_names: relevantDefs.map((t) => t.name),
