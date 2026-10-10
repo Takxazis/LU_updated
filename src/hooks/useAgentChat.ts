@@ -44,6 +44,7 @@ import { mediaCallSucceeded } from '../lib/media-result'
 import { summarizeTurn } from '../lib/turn-summary'
 import { buildVisionFeedback } from '../api/vision-feedback'
 import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
+import { measureLogicalModelRequest, measureTokenCalibration } from '../lib/model-request-measurement'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
@@ -1560,6 +1561,18 @@ export function useAgentChat() {
             useSendSizeStore.getState().reportTools(convId, estimateTokens(JSON.stringify(tools)))
           }
 
+          const contextMeasurement = measureLogicalModelRequest({
+            provider: providerId,
+            model: modelToUse,
+            conversationId: convId!,
+            step: stepNo,
+            messages: sendMessages,
+            tools,
+            modelContextLimit: agentCtx,
+            effectiveSendWindow: sendWindow,
+          })
+          log.warn('agent.context_measurement', contextMeasurement)
+
           // Aus den beiden Transporten abgeleitet statt abgeschrieben. Die
           // abgeschriebene Fassung kannte `doneReason` nicht, und ein Feld, das
           // ein Transport liefert und diese Zeile verschweigt, ist genau die
@@ -1803,6 +1816,18 @@ export function useAgentChat() {
               totalTokens: (turn.promptEvalCount || 0) + (turn.evalCount || 0),
               estimated: false,
             })
+            if (turn.promptEvalCount) {
+              log.warn('agent.context_calibration', {
+                provider: providerId,
+                model: modelToUse,
+                conversation_id: convId!,
+                step: stepNo,
+                ...measureTokenCalibration(
+                  contextMeasurement.estimated_total_units,
+                  turn.promptEvalCount,
+                ),
+              })
+            }
           }
           // Native thinking field (Ollama; LU Cloud reasoning_content)
           if (turn.thinking) turnThinking = turn.thinking

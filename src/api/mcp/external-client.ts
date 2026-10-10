@@ -261,6 +261,9 @@ export class MCPExternalClient {
           spawnError = null
           break
         } catch (err) {
+			throw new Error(`DEBUG ${program}`)
+			alert(`MCP SPAWN FAILED\n\n${program}\n\n${String(err)}`)
+			console.error("MCP SPAWN FAILED:", program, err)
           spawnError = err
         }
       }
@@ -627,5 +630,5 @@ export function commandCandidatesForPlatform(
   if (/[\\/]|\.(cmd|bat|exe)$/i.test(command)) return [command]
   const CMD_SHIM_FIRST = new Set(['npx', 'npm', 'pnpm', 'yarn', 'corepack'])
   if (CMD_SHIM_FIRST.has(command)) return [`${command}.cmd`, command]
-  return [command, `${command}.cmd`]
+  return [command]
 }

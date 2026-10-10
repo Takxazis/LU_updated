@@ -17,10 +17,14 @@
     {
       "identifier": "shell:allow-spawn",
       "allow": [
-        { "name": "npx", "cmd": "npx", "args": true },
-        { "name": "npx.cmd", "cmd": "npx.cmd", "args": true },
-        { "name": "uvx", "cmd": "uvx", "args": true }
-      ]
+  { "name": "npx", "cmd": "npx", "args": true },
+  { "name": "npx.cmd", "cmd": "npx.cmd", "args": true },
+  {
+    "name": "uvx",
+    "cmd": "C:\\Users\\Takxa\\.local\\bin\\uvx.exe",
+    "args": true
+  }
+]
     },
     "shell:allow-stdin-write",
     "shell:allow-kill",

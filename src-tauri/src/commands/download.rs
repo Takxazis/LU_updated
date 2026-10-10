@@ -1085,7 +1085,11 @@ pub(crate) fn is_huggingface_host(url: &str) -> bool {
         Ok(u) => u.host_str().unwrap_or("").to_ascii_lowercase(),
         Err(_) => return false,
     };
-    host == "huggingface.co" || host == "hf.co" || host.ends_with(".huggingface.co")
+
+    host == "huggingface.co"
+        || host == "hf.co"
+        || host.ends_with(".huggingface.co")
+        || host.ends_with(".hf.co")
 }
 
 /// What the user reads when a download comes back refused.

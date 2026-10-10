@@ -1289,7 +1289,7 @@ pub async fn pull_model_stream(app: tauri::AppHandle, state: tauri::State<'_, cr
         .map(|g| g.clone())
         .unwrap_or_else(|| "http://localhost:11434".to_string());
     let pull_url = format!("{}/api/pull", ollama_base.trim_end_matches('/'));
-
+println!("[PULL MODEL] {}", name);
     let resp = client
         .post(&pull_url)
         .header("Content-Type", "application/json")

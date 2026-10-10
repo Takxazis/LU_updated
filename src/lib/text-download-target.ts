@@ -63,7 +63,7 @@ export function resolveTextDownloadTarget(input: TextDownloadTargetInput): TextD
   const active = providerIdOf(input.activeChatModel)
   const managedBuiltin = !!openai?.enabled && openai?.managed === true
 
-  if (active === 'ollama') return 'ollama'
+  if (active === 'ollama' && !managedBuiltin) return 'ollama'
   if (active === 'openai') {
     if (openai?.managed) return 'builtin'
     return isLmStudioName(openai?.name) ? 'lmstudio' : 'openai-compat'

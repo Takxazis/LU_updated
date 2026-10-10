@@ -2847,6 +2847,7 @@ fn start_after_stop(
         AttemptFlags { auto_layers, cpu_fallback: false },
         backend_dir.as_deref(),
     );
+	println!("[ENGINE START] model_path={}", model_path);
     let failure = match first {
         Ok(startup) => {
             tracing::info!(target: "engine", port, attempt = 1, "the LU Engine is serving");
