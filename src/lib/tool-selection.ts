@@ -648,6 +648,88 @@ export function toolSelectionOpts(
     : { embed }
 }
 
+export const NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS = 192
+
+export interface SemanticOnlyBudgetResult {
+  defs: MCPToolDefinition[]
+  keptNames: string[]
+  droppedNames: string[]
+  usedUnits: number
+}
+
+/**
+ * Keep every deterministic/pinned capability and spend a small weighted
+ * allowance only on embedding-only helpers. Candidates follow semantic rank;
+ * an oversized candidate is skipped rather than blocking cheaper ones below.
+ *
+ * web_search + web_fetch are atomic when both are present. A semantic-only
+ * web_search without web_fetch is dropped: snippets without a reader violate
+ * the router's long-standing web-pair contract.
+ */
+export function applySemanticOnlyBudget(
+  defs: MCPToolDefinition[],
+  semanticRank: string[],
+  protectedNames: Iterable<string>,
+  maxUnits: number,
+  definitionUnits: (def: MCPToolDefinition) => number,
+): SemanticOnlyBudgetResult {
+  const protectedSet = new Set(protectedNames)
+  const byName = new Map(defs.map((def) => [def.name, def]))
+  const semanticSet = new Set(semanticRank)
+  const optionalSet = new Set(
+    defs.filter((def) => semanticSet.has(def.name) && !protectedSet.has(def.name)).map((def) => def.name),
+  )
+  const kept = new Set(defs.filter((def) => !optionalSet.has(def.name)).map((def) => def.name))
+  const decided = new Set<string>()
+  const keptNames: string[] = []
+  const droppedNames: string[] = []
+  let usedUnits = 0
+
+  const decide = (names: string[]) => {
+    const present = names.filter((name) => optionalSet.has(name) && byName.has(name) && !decided.has(name))
+    if (present.length === 0) return
+    present.forEach((name) => decided.add(name))
+    const cost = present.reduce((sum, name) => sum + definitionUnits(byName.get(name)!), 0)
+    if (cost <= Math.max(0, maxUnits - usedUnits)) {
+      present.forEach((name) => kept.add(name))
+      keptNames.push(...present)
+      usedUnits += cost
+    } else {
+      droppedNames.push(...present)
+    }
+  }
+
+  for (const name of semanticRank) {
+    if (!optionalSet.has(name) || decided.has(name)) continue
+    if (name === 'web_search') {
+      if (optionalSet.has('web_fetch')) decide(['web_search', 'web_fetch'])
+      else {
+        decided.add(name)
+        droppedNames.push(name)
+      }
+      continue
+    }
+    if (name === 'web_fetch' && optionalSet.has('web_search')) {
+      decide(['web_search', 'web_fetch'])
+      continue
+    }
+    decide([name])
+  }
+
+  // Defensive: semantic names should be ranked, but never let an unranked
+  // optional tool bypass the allowance if a backend returns a malformed list.
+  for (const name of optionalSet) {
+    if (!decided.has(name)) droppedNames.push(name)
+  }
+
+  return {
+    defs: defs.filter((def) => kept.has(def.name)),
+    keptNames,
+    droppedNames,
+    usedUnits,
+  }
+}
+
 export async function selectRelevantToolsAsync(
   userMessage: string,
   allTools: MCPToolDefinition[],

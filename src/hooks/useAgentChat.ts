@@ -60,7 +60,7 @@ import { extractMemoriesFromPair } from './useMemory'
 import { useAgentWorkflowStore } from '../stores/agentWorkflowStore'
 import { WorkflowEngine, describeWorkflowCompletion, describeWorkflowStepFailure } from '../lib/workflow-engine'
 import type { AgentBlock, AgentToolCall } from '../types/agent-mode'
-import { selectRelevantToolsAsync, toolSelectionOpts, ALWAYS_INCLUDE, gateCreateTools, isGatedTool } from '../lib/tool-selection'
+import { selectRelevantToolsAsync, toolSelectionOpts, ALWAYS_INCLUDE, gateCreateTools, isGatedTool, applySemanticOnlyBudget, NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS } from '../lib/tool-selection'
 import { renderToolRoster, renderToolNames } from '../lib/tool-roster'
 import { MUTATING_TOOLS, allowedInReadOnlyTurn } from '../lib/mutating-tools'
 import { resolveApprovalLevel } from '../lib/agent-approval-policy'
@@ -1577,14 +1577,9 @@ export function useAgentChat() {
           // the loop and is intentionally unchanged in this first parity pass.
           // Native transports can apply the same final gate as useCodex without
           // rebuilding goal/workspace/persona/RAG/clock prompt suffixes.
-          const relevantDefs = strategy === 'hermes_xml'
+          const gatedDefs = strategy === 'hermes_xml'
             ? routedDefs
             : gateCreateTools(routedDefs, lastUserMsg, createGateOpened)
-          const tools: ToolDefinition[] = relevantDefs.map(t => ({
-            type: 'function' as const,
-            function: { name: t.name, description: t.description, parameters: t.inputSchema },
-          }))
-          const selectedNames = new Set(relevantDefs.map((t) => t.name))
           const deterministicOriginNames = new Set([
             ...deterministicProvenance.always_include_names,
             ...deterministicProvenance.keyword_names,
@@ -1593,8 +1588,37 @@ export function useAgentChat() {
             ...deterministicProvenance.fallback_names,
             ...deterministicProvenance.safety_names,
           ])
+          // Codex-compatible self-heal opens all gated schemas for the rest of
+          // the run. Once open, the optional semantic budget must not close
+          // them again and undo that recovery contract.
+          if (createGateOpened) {
+            for (const def of gatedDefs) if (isGatedTool(def.name)) deterministicOriginNames.add(def.name)
+          }
           const semanticNames = semanticRank.map((entry) => entry.name)
           const semanticOnlyNames = semanticNames.filter((name) => !deterministicOriginNames.has(name))
+          const wireDefinitionUnits = (def: typeof gatedDefs[number]) => estimateTokens(JSON.stringify({
+            type: 'function' as const,
+            function: { name: def.name, description: def.description, parameters: def.inputSchema },
+          }))
+          // Hermes already paid for its pre-loop prompt catalog, and Small-
+          // Model Mode has its own measured count cap. This weighted allowance
+          // is deliberately Normal-Mode native Agent policy only.
+          const budget = strategy === 'hermes_xml' || settings.smallModelMode
+            ? { defs: gatedDefs, keptNames: [] as string[], droppedNames: [] as string[], usedUnits: 0 }
+            : applySemanticOnlyBudget(
+                gatedDefs,
+                semanticNames,
+                deterministicOriginNames,
+                NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS,
+                wireDefinitionUnits,
+              )
+          const relevantDefs = budget.defs
+          const tools: ToolDefinition[] = relevantDefs.map(t => ({
+            type: 'function' as const,
+            function: { name: t.name, description: t.description, parameters: t.inputSchema },
+          }))
+          const gateSelectedNames = new Set(gatedDefs.map((t) => t.name))
+          const selectedNames = new Set(relevantDefs.map((t) => t.name))
           log.warn('agent.tool_selection_measurement', {
             event: 'agent_tool_selection_measurement',
             provider: providerId,
@@ -1608,7 +1632,13 @@ export function useAgentChat() {
             selected_semantic_only_names: semanticOnlyNames.filter((name) => selectedNames.has(name)),
             ...deterministicProvenance,
             routed_names: routedDefs.map((t) => t.name),
-            gated_out: routedDefs.filter((t) => !selectedNames.has(t.name)).map((t) => t.name),
+            gated_out: routedDefs.filter((t) => !gateSelectedNames.has(t.name)).map((t) => t.name),
+            semantic_budget_limit_units: strategy === 'hermes_xml' || settings.smallModelMode
+              ? null
+              : NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS,
+            semantic_budget_used_units: budget.usedUnits,
+            semantic_budget_kept: budget.keptNames,
+            semantic_budget_dropped: budget.droppedNames,
             selected_names: relevantDefs.map((t) => t.name),
             selected_definition_units: estimateTokens(JSON.stringify(tools)),
           })

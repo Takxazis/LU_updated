@@ -23,9 +23,17 @@ describe('Agent tool provenance telemetry', () => {
     ]) expect(source).toContain(field)
   })
 
-  it('does not change selection behavior or add a budget', () => {
-    expect(source).not.toContain('semanticBudget')
-    expect(source).not.toContain('maxDefinitionUnits')
+  it('keeps deterministic provenance protected from the semantic-only budget', () => {
+    const protectedAt = source.indexOf('const deterministicOriginNames = new Set([')
+    const budgetAt = source.indexOf('applySemanticOnlyBudget(', protectedAt)
+    expect(protectedAt).toBeGreaterThan(-1)
+    expect(budgetAt).toBeGreaterThan(protectedAt)
+    for (const field of [
+      'always_include_names', 'keyword_names', 'external_names', 'verbatim_names',
+      'fallback_names', 'safety_names',
+    ]) {
+      expect(source.slice(protectedAt, budgetAt)).toContain(`deterministicProvenance.${field}`)
+    }
     expect(source).toContain(': gateCreateTools(routedDefs, lastUserMsg, createGateOpened)')
   })
 })

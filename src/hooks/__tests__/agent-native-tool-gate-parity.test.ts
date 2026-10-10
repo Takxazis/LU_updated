@@ -7,7 +7,7 @@ describe('Agent native tool gate parity', () => {
   it('imports and applies the shared Codex gate after routing', () => {
     expect(source).toContain('gateCreateTools, isGatedTool')
     expect(source).toMatch(
-      /const routedDefs = await selectRelevantToolsAsync\([\s\S]*?const relevantDefs = strategy === 'hermes_xml'[\s\S]*?\? routedDefs[\s\S]*?: gateCreateTools\(routedDefs, lastUserMsg, createGateOpened\)/,
+      /const routedDefs = await selectRelevantToolsAsync\([\s\S]*?const gatedDefs = strategy === 'hermes_xml'[\s\S]*?\? routedDefs[\s\S]*?: gateCreateTools\(routedDefs, lastUserMsg, createGateOpened\)/,
     )
   })
 
