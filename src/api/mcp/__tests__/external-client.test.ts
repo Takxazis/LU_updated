@@ -29,6 +29,8 @@ interface FakeRequest {
   id?: number
   method?: string
   params?: { arguments?: Record<string, unknown> }
+  result?: unknown
+  error?: unknown
 }
 
 /** Server behaviour a single test wants: id/method → response line. */
@@ -168,6 +170,43 @@ describe('connecting to an external server', () => {
     await client.connect()
 
     expect(await client.callTool('get_forecast', { city: 'Berlin' })).toBe('sunny in Berlin')
+  })
+
+  it('answers a server-initiated roots/list request while a tool call is in flight', async () => {
+    const client = new MCPExternalClient(config)
+    await client.connect()
+
+    let originalCallId: number | undefined
+
+    responder = (req) => {
+      if (req.method === 'tools/call') {
+        originalCallId = req.id
+        return JSON.stringify({
+          jsonrpc: '2.0',
+          id: 900,
+          method: 'roots/list',
+          params: {},
+        })
+      }
+
+      if (req.id === 900 && req.method === undefined) {
+        expect(req.result).toEqual({ roots: [] })
+
+        return JSON.stringify({
+          jsonrpc: '2.0',
+          id: originalCallId,
+          result: {
+            content: [{ type: 'text', text: 'tool completed after roots response' }],
+          },
+        })
+      }
+
+      return null
+    }
+
+    await expect(
+      client.callTool('get_forecast', { city: 'Berlin' }),
+    ).resolves.toBe('tool completed after roots response')
   })
 
   it('surfaces a JSON-RPC error as a rejection', async () => {

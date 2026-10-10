@@ -475,6 +475,46 @@ export class MCPExternalClient {
         // Not JSON — a server that logs to stdout, ignore.
         continue
       }
+      if (isRecord(parsed)) {
+        const serverRequestId = asNumber(parsed.id)
+        const serverRequestMethod = asString(parsed.method)
+
+        if (serverRequestId !== undefined && serverRequestMethod) {
+          const result =
+            serverRequestMethod === "roots/list"
+              ? { roots: [] }
+              : undefined
+
+          const reply =
+            result !== undefined
+              ? {
+                  jsonrpc: "2.0",
+                  id: serverRequestId,
+                  result,
+                }
+              : {
+                  jsonrpc: "2.0",
+                  id: serverRequestId,
+                  error: {
+                    code: -32601,
+                    message: `Method not supported by LU MCP client: ${serverRequestMethod}`,
+                  },
+                }
+
+          void Promise.resolve(
+            this.child?.write(JSON.stringify(reply) + "\n"),
+          ).catch((err: unknown) => {
+            log.warn(`[MCP:${this.config.name}] failed to answer server request`, {
+              id: serverRequestId,
+              method: serverRequestMethod,
+              err: errorText(err),
+            })
+          })
+
+          continue
+        }
+      }
+
       const response = parseJsonRpcResponse(parsed)
       if (!response || response.id === undefined) continue // notification or noise
       const pending = this.pendingRequests.get(response.id)
