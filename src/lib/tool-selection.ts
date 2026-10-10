@@ -249,7 +249,7 @@ export const SMALL_MODEL_MAX_TOOLS = ALWAYS_INCLUDE.length + 2
 /** Tool count at which embedding-based routing becomes worth the round trip. */
 export const EMBEDDING_ROUTING_THRESHOLD = 15
 
-import type { EmbeddingFn } from '../api/agents/embedding-router'
+import type { EmbeddingFn, SemanticToolRank } from '../api/agents/embedding-router'
 import { selectToolsByEmbedding } from '../api/agents/embedding-router'
 
 /**
@@ -518,10 +518,18 @@ const SMALL_MODEL_EMBEDDING_THRESHOLD = 6
  * lib/__tests__/hermes-werkzeugauswahl.test.ts haelt fest, dass keiner der
  * beiden Zweige die Zahlen wieder selbst ausbuchstabiert.
  */
+export interface ToolSelectionOptions {
+  embed?: EmbeddingFn
+  embeddingThreshold?: number
+  topN?: number
+  maxTools?: number
+  onSemanticRank?: (ranked: SemanticToolRank[]) => void
+}
+
 export function toolSelectionOpts(
   smallModelMode: boolean,
   embed?: EmbeddingFn,
-): { embed?: EmbeddingFn; embeddingThreshold?: number; topN?: number; maxTools?: number } {
+): ToolSelectionOptions {
   return smallModelMode
     ? {
         embed,
@@ -536,7 +544,7 @@ export async function selectRelevantToolsAsync(
   userMessage: string,
   allTools: MCPToolDefinition[],
   permissions: PermissionMap,
-  opts?: { embed?: EmbeddingFn; embeddingThreshold?: number; topN?: number; maxTools?: number },
+  opts?: ToolSelectionOptions,
 ): Promise<MCPToolDefinition[]> {
   const threshold = opts?.embeddingThreshold ?? EMBEDDING_ROUTING_THRESHOLD
   const available = allTools.filter((t) => permissions[t.category] !== 'blocked')
@@ -549,7 +557,11 @@ export async function selectRelevantToolsAsync(
       userMessage,
       available.map((t) => ({ name: t.name, description: t.description })),
       opts.embed,
-      { topN: opts.topN ?? 10, alwaysInclude: ALWAYS_INCLUDE },
+      {
+        topN: opts.topN ?? 10,
+        alwaysInclude: ALWAYS_INCLUDE,
+        onRanked: opts.onSemanticRank,
+      },
     )
     const keyword = selectRelevantTools(userMessage, allTools, permissions)
     const union = new Set<string>([...semanticNames, ...keyword.map((t) => t.name)])

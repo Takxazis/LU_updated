@@ -24,6 +24,12 @@
 
 export type EmbeddingFn = (texts: string[]) => Promise<number[][]>
 
+/** Safe semantic-routing diagnostics: names and cosine scores only. */
+export interface SemanticToolRank {
+  name: string
+  score: number
+}
+
 interface ToolLike {
   name: string
   description: string
@@ -136,7 +142,11 @@ export async function selectToolsByEmbedding(
   query: string,
   tools: ToolLike[],
   embed: EmbeddingFn,
-  opts: { topN?: number; alwaysInclude?: string[] } = {}
+  opts: {
+    topN?: number
+    alwaysInclude?: string[]
+    onRanked?: (ranked: SemanticToolRank[]) => void
+  } = {}
 ): Promise<string[]> {
   const topN = opts.topN ?? 10
   const always = opts.alwaysInclude ?? []
@@ -145,6 +155,7 @@ export async function selectToolsByEmbedding(
   await precomputeToolEmbeddings(tools, embed)
 
   const ranked = await rankToolsByEmbedding(query, tools, embed, { topN })
+  opts.onRanked?.(ranked.map(({ tool, score }) => ({ name: tool.name, score })))
   const names = ranked.map((r) => r.tool.name)
   const out = [...names]
   for (const a of always) if (!out.includes(a)) out.push(a)

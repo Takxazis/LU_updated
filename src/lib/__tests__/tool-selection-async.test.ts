@@ -90,6 +90,36 @@ describe('tool-selection — selectRelevantToolsAsync', () => {
     expect(out.some((t) => t.name === 'file_write')).toBe(true)
   })
 
+  it('forwards semantic rank only when embedding routing succeeds', async () => {
+    const tools = Array.from({ length: 16 }, (_, i) =>
+      mkTool(`tool_${i}`, `description about topic ${i}`),
+    )
+    const seen: Array<Array<{ name: string; score: number }>> = []
+    await selectRelevantToolsAsync('topic 3', tools, fullPerms, {
+      embed: fakeEmbed,
+      embeddingThreshold: 5,
+      topN: 3,
+      onSemanticRank: (ranked) => { seen.push(ranked) },
+    })
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toHaveLength(3)
+    expect(seen[0]!.every((entry) => typeof entry.name === 'string' && typeof entry.score === 'number')).toBe(true)
+  })
+
+  it('does not report semantic rank on the keyword-only path', async () => {
+    const seen = vi.fn()
+    await selectRelevantToolsAsync(
+      'run the build',
+      [
+        mkTool('file_read', 'read a file', 'filesystem'),
+        mkTool('shell_execute', 'run a command', 'terminal'),
+      ],
+      fullPerms,
+      { embed: fakeEmbed, embeddingThreshold: 15, onSemanticRank: seen },
+    )
+    expect(seen).not.toHaveBeenCalled()
+  })
+
   it('embed failure falls back silently to keyword', async () => {
     const tools = Array.from({ length: 20 }, (_, i) =>
       mkTool(`t${i}`, `desc ${i}`, 'filesystem')

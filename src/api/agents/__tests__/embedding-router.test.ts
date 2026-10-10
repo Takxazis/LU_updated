@@ -126,6 +126,24 @@ describe('embedding-router — selectToolsByEmbedding', () => {
     expect(out).toContain('get_current_time')
   })
 
+  it('reports score-only semantic rank before alwaysInclude is appended', async () => {
+    const tools = [
+      { name: 'read_file', description: 'open and read a file on disk' },
+      { name: 'search_web', description: 'search online information' },
+      { name: 'always_tool', description: 'unrelated fallback capability' },
+    ]
+    let seen: Array<{ name: string; score: number }> = []
+    await selectToolsByEmbedding('read a file', tools, fakeEmbed, {
+      topN: 1,
+      alwaysInclude: ['always_tool'],
+      onRanked: (ranked) => { seen = ranked },
+    })
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.name).toBe('read_file')
+    expect(typeof seen[0]?.score).toBe('number')
+    expect(seen.some((entry) => entry.name === 'always_tool')).toBe(false)
+  })
+
   it('does not duplicate when an always-include name is already ranked', async () => {
     const tools = [
       { name: 'get_current_time', description: 'return current local date and time now' },

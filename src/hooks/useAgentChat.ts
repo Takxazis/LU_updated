@@ -1548,11 +1548,18 @@ export function useAgentChat() {
           // Als sie hier standen, gab es sie nur an DIESER Stelle — der
           // hermes_xml-Zweig oben nahm stattdessen den ganzen Katalog, und
           // niemandem fiel es auf, weil nichts brach.
+          let semanticRank: Array<{ name: string; score: number }> = []
+          const selectionOpts = toolSelectionOpts(
+            !!settings.smallModelMode,
+            (texts) => generateEmbeddings(texts),
+          )
+          selectionOpts.onSemanticRank = (ranked) => { semanticRank = ranked }
+          const availableDefs = toolRegistry.getAll().filter((t) => toolMatchesCurated(t.name))
           const routedDefs = await selectRelevantToolsAsync(
             lastUserMsg,
-            toolRegistry.getAll().filter((t) => toolMatchesCurated(t.name)),
+            availableDefs,
             permissions,
-            toolSelectionOpts(!!settings.smallModelMode, (texts) => generateEmbeddings(texts)),
+            selectionOpts,
           )
           // The Hermes catalog is embedded in the run's system message before
           // the loop and is intentionally unchanged in this first parity pass.
@@ -1565,6 +1572,20 @@ export function useAgentChat() {
             type: 'function' as const,
             function: { name: t.name, description: t.description, parameters: t.inputSchema },
           }))
+          const selectedNames = new Set(relevantDefs.map((t) => t.name))
+          log.warn('agent.tool_selection_measurement', {
+            event: 'agent_tool_selection_measurement',
+            provider: providerId,
+            model: modelToUse,
+            conversation_id: convId!,
+            step: stepNo,
+            available_count: availableDefs.length,
+            semantic_rank: semanticRank,
+            routed_names: routedDefs.map((t) => t.name),
+            gated_out: routedDefs.filter((t) => !selectedNames.has(t.name)).map((t) => t.name),
+            selected_names: relevantDefs.map((t) => t.name),
+            selected_definition_units: estimateTokens(JSON.stringify(tools)),
+          })
           // Same reason as the coding loop: the catalog rides as its own field
           // on the wire, so the message estimate the builder reported never saw
           // it and the meter read low by the whole catalog.
