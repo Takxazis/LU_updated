@@ -33,6 +33,8 @@ import { codexStallVerdict } from '../stall-verdict'
 import { isThinkingUnsupportedError } from '../thinking-downgrade'
 import { seedEstimatedUsage, reportTurnUsage } from '../turn-usage'
 import { useChatStore } from '../../../stores/chatStore'
+import { estimateTokens } from '../../../lib/context-compaction'
+import { toolCatalogUnits } from '../../../lib/tool-catalog-budget'
 
 // ── Der Live-Anstrich ───────────────────────────────────────────────────────
 
@@ -235,6 +237,33 @@ describe('Das Feld usage: eine Schaetzung ueberschreibt nie eine echte Zahl', ()
     seedEstimatedUsage(convId, MSG, [{ role: 'user', content: 'hallo welt' }], [])
     expect(usage()?.estimated).toBe(true)
     expect(usage()?.promptTokens).toBeGreaterThan(0)
+  })
+
+  it('ein leerer Werkzeugkatalog kostet keine Phantom-Einheiten', () => {
+    seedEstimatedUsage(convId, MSG, [{ role: 'user', content: 'hallo welt' }], [])
+    expect(usage()?.promptTokens).toBe(estimateTokens('hallo welt'))
+    expect(toolCatalogUnits([])).toBe(0)
+  })
+
+  it('die Schaetzung benutzt fuer Werkzeuge denselben gemeinsamen Katalogwert', () => {
+    const tools = [
+      {
+        type: 'function' as const,
+        function: {
+          name: 'file_read',
+          description: 'Read a file from disk',
+          parameters: {
+            type: 'object' as const,
+            properties: { path: { type: 'string' } },
+            required: ['path'],
+          },
+        },
+      },
+    ]
+    seedEstimatedUsage(convId, MSG, [{ role: 'user', content: 'hallo' }], tools)
+    expect(usage()?.promptTokens).toBe(
+      estimateTokens('hallo') + toolCatalogUnits(tools),
+    )
   })
 
   it('die echte Zahl des Modells setzt estimated auf false', () => {

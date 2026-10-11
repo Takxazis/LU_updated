@@ -47,6 +47,7 @@ import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
 import { measureLogicalModelRequest, measureTokenCalibration } from '../lib/model-request-measurement'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
+import { toolAwareHistoryAllowance, toolCatalogUnits } from '../lib/tool-catalog-budget'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1449,6 +1450,124 @@ export function useAgentChat() {
           smallModelMode: settings.smallModelMode,
           localBackend: sendsToALanBackend(providerId),
         })
+        let nativeTools: ToolDefinition[] = []
+        let nativeToolUnits = 0
+        if (strategy === 'native') {
+          // Intelligent tool selection — keyword for small lists, embedding
+          // routing once the total tool count grows past the threshold
+          // (Phase 9). The embedding call is best-effort: if Ollama is
+          // unreachable it silently falls back to keyword-only.
+          // Route on the USER's instruction, never on the newest user-role
+          // message (audit B6): steers, over-loop notes and read-only blocks
+          // are pushed as role 'user', and routing on those swapped the tool
+          // list mid-run to whatever the harness said last.
+          const lastUserMsg = userContent
+          // Small-Model Mode (Knob 1): tighten the tool cap and force the
+          // embedding router even on a modest catalog (threshold 6) so a 3B-8B
+          // model sees ≤6 semantically-ranked tools. Default mode keeps the
+          // permissive selection unchanged for big models.
+          // Die Zahlen dahinter stehen in `toolSelectionOpts`, nicht hier.
+          // Als sie hier standen, gab es sie nur an DIESER Stelle — der
+          // hermes_xml-Zweig oben nahm stattdessen den ganzen Katalog, und
+          // niemandem fiel es auf, weil nichts brach.
+          let semanticRank: Array<{ name: string; score: number }> = []
+          let deterministicProvenance = {
+            always_include_names: [] as string[],
+            keyword_names: [] as string[],
+            external_names: [] as string[],
+            verbatim_names: [] as string[],
+            fallback_names: [] as string[],
+            safety_names: [] as string[],
+            deterministic_names: [] as string[],
+          }
+          const selectionOpts = toolSelectionOpts(
+            !!settings.smallModelMode,
+            (texts) => generateEmbeddings(texts),
+          )
+          selectionOpts.onSemanticRank = (ranked) => { semanticRank = ranked }
+          selectionOpts.onDeterministicProvenance = (provenance) => {
+            deterministicProvenance = provenance
+          }
+          const availableDefs = toolRegistry.getAll().filter((t) => toolMatchesCurated(t.name))
+          const routedDefs = await selectRelevantToolsAsync(
+            lastUserMsg,
+            availableDefs,
+            permissions,
+            selectionOpts,
+          )
+          // The Hermes catalog is embedded in the run's system message before
+          // the loop and is intentionally unchanged in this first parity pass.
+          // Native transports can apply the same final gate as useCodex without
+          // rebuilding goal/workspace/persona/RAG/clock prompt suffixes.
+          const gatedDefs = gateCreateTools(routedDefs, lastUserMsg, createGateOpened)
+          const deterministicOriginNames = new Set([
+            ...deterministicProvenance.always_include_names,
+            ...deterministicProvenance.keyword_names,
+            ...deterministicProvenance.external_names,
+            ...deterministicProvenance.verbatim_names,
+            ...deterministicProvenance.fallback_names,
+            ...deterministicProvenance.safety_names,
+          ])
+          // Codex-compatible self-heal opens all gated schemas for the rest of
+          // the run. Once open, the optional semantic budget must not close
+          // them again and undo that recovery contract.
+          if (createGateOpened) {
+            for (const def of gatedDefs) if (isGatedTool(def.name)) deterministicOriginNames.add(def.name)
+          }
+          const semanticNames = semanticRank.map((entry) => entry.name)
+          const semanticOnlyNames = semanticNames.filter((name) => !deterministicOriginNames.has(name))
+          const wireDefinitionUnits = (def: typeof gatedDefs[number]) => estimateTokens(JSON.stringify({
+            type: 'function' as const,
+            function: { name: def.name, description: def.description, parameters: def.inputSchema },
+          }))
+          // Small-Model Mode has its own measured count cap. This weighted
+          // allowance is deliberately Normal-Mode native Agent policy only;
+          // prompt-based transports never enter this native preparation block.
+          const budget = settings.smallModelMode
+            ? { defs: gatedDefs, keptNames: [] as string[], droppedNames: [] as string[], usedUnits: 0 }
+            : applySemanticOnlyBudget(
+                gatedDefs,
+                semanticNames,
+                deterministicOriginNames,
+                NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS,
+                wireDefinitionUnits,
+              )
+          const relevantDefs = budget.defs
+          nativeTools = relevantDefs.map(t => ({
+            type: 'function' as const,
+            function: { name: t.name, description: t.description, parameters: t.inputSchema },
+          }))
+          nativeToolUnits = toolCatalogUnits(nativeTools)
+          const gateSelectedNames = new Set(gatedDefs.map((t) => t.name))
+          const selectedNames = new Set(relevantDefs.map((t) => t.name))
+          log.warn('agent.tool_selection_measurement', {
+            event: 'agent_tool_selection_measurement',
+            provider: providerId,
+            model: modelToUse,
+            conversation_id: convId!,
+            step: stepNo,
+            available_count: availableDefs.length,
+            semantic_rank: semanticRank,
+            semantic_names: semanticNames,
+            semantic_only_names: semanticOnlyNames,
+            selected_semantic_only_names: semanticOnlyNames.filter((name) => selectedNames.has(name)),
+            ...deterministicProvenance,
+            routed_names: routedDefs.map((t) => t.name),
+            gated_out: routedDefs.filter((t) => !gateSelectedNames.has(t.name)).map((t) => t.name),
+            semantic_budget_limit_units: settings.smallModelMode
+              ? null
+              : NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS,
+            semantic_budget_used_units: budget.usedUnits,
+            semantic_budget_kept: budget.keptNames,
+            semantic_budget_dropped: budget.droppedNames,
+            selected_names: relevantDefs.map((t) => t.name),
+            selected_definition_units: nativeToolUnits,
+          })
+        }
+
+        const historyAllowance = strategy === 'native'
+          ? toolAwareHistoryAllowance(sendWindow, nativeToolUnits)
+          : sendWindow
         let sendMessages: ChatMessage[] = agentMessages.slice()
         let trimmedReadKeys: ReadonlySet<string> = NO_TRIMMED_KEYS
         try {
@@ -1458,9 +1577,9 @@ export function useAgentChat() {
           // moves every step is a prompt prefix that is never the same twice.
           // Whole messages are dropped here, never shortened: decay stays on
           // the send copy alone, so the store keeps every result complete.
-          agentMessages = trimWorkingHistory(agentMessages, sendWindow, { enabled: decayOn, hysteresis: decayOn }).messages
+          agentMessages = trimWorkingHistory(agentMessages, historyAllowance, { enabled: decayOn, hysteresis: decayOn }).messages
           const built = buildRequestMessages(agentMessages, {
-            budgetTokens: sendWindow,
+            budgetTokens: historyAllowance,
             enabled: decayOn,
             hysteresis: decayOn,
             keyOf: (m) => guardKeyOfResult.get(m as unknown as object),
@@ -1524,129 +1643,14 @@ export function useAgentChat() {
         }
 
         if (strategy === 'native') {
-          // Show thinking indicator while model processes
-          const thinkingBlockId = uuid()
-          addBlock(runState, convId!, assistantMessage.id, {
-            id: thinkingBlockId, phase: 'thinking', content: 'Analyzing...',
-            timestamp: Date.now(),
-          })
+          const tools = nativeTools
+          const toolUnits = nativeToolUnits
 
-          // Intelligent tool selection — keyword for small lists, embedding
-          // routing once the total tool count grows past the threshold
-          // (Phase 9). The embedding call is best-effort: if Ollama is
-          // unreachable it silently falls back to keyword-only.
-          // Route on the USER's instruction, never on the newest user-role
-          // message (audit B6): steers, over-loop notes and read-only blocks
-          // are pushed as role 'user', and routing on those swapped the tool
-          // list mid-run to whatever the harness said last.
-          const lastUserMsg = userContent
-          // Small-Model Mode (Knob 1): tighten the tool cap and force the
-          // embedding router even on a modest catalog (threshold 6) so a 3B-8B
-          // model sees ≤6 semantically-ranked tools. Default mode keeps the
-          // permissive selection unchanged for big models.
-          // Die Zahlen dahinter stehen in `toolSelectionOpts`, nicht hier.
-          // Als sie hier standen, gab es sie nur an DIESER Stelle — der
-          // hermes_xml-Zweig oben nahm stattdessen den ganzen Katalog, und
-          // niemandem fiel es auf, weil nichts brach.
-          let semanticRank: Array<{ name: string; score: number }> = []
-          let deterministicProvenance = {
-            always_include_names: [] as string[],
-            keyword_names: [] as string[],
-            external_names: [] as string[],
-            verbatim_names: [] as string[],
-            fallback_names: [] as string[],
-            safety_names: [] as string[],
-            deterministic_names: [] as string[],
-          }
-          const selectionOpts = toolSelectionOpts(
-            !!settings.smallModelMode,
-            (texts) => generateEmbeddings(texts),
-          )
-          selectionOpts.onSemanticRank = (ranked) => { semanticRank = ranked }
-          selectionOpts.onDeterministicProvenance = (provenance) => {
-            deterministicProvenance = provenance
-          }
-          const availableDefs = toolRegistry.getAll().filter((t) => toolMatchesCurated(t.name))
-          const routedDefs = await selectRelevantToolsAsync(
-            lastUserMsg,
-            availableDefs,
-            permissions,
-            selectionOpts,
-          )
-          // The Hermes catalog is embedded in the run's system message before
-          // the loop and is intentionally unchanged in this first parity pass.
-          // Native transports can apply the same final gate as useCodex without
-          // rebuilding goal/workspace/persona/RAG/clock prompt suffixes.
-          const gatedDefs = strategy === 'hermes_xml'
-            ? routedDefs
-            : gateCreateTools(routedDefs, lastUserMsg, createGateOpened)
-          const deterministicOriginNames = new Set([
-            ...deterministicProvenance.always_include_names,
-            ...deterministicProvenance.keyword_names,
-            ...deterministicProvenance.external_names,
-            ...deterministicProvenance.verbatim_names,
-            ...deterministicProvenance.fallback_names,
-            ...deterministicProvenance.safety_names,
-          ])
-          // Codex-compatible self-heal opens all gated schemas for the rest of
-          // the run. Once open, the optional semantic budget must not close
-          // them again and undo that recovery contract.
-          if (createGateOpened) {
-            for (const def of gatedDefs) if (isGatedTool(def.name)) deterministicOriginNames.add(def.name)
-          }
-          const semanticNames = semanticRank.map((entry) => entry.name)
-          const semanticOnlyNames = semanticNames.filter((name) => !deterministicOriginNames.has(name))
-          const wireDefinitionUnits = (def: typeof gatedDefs[number]) => estimateTokens(JSON.stringify({
-            type: 'function' as const,
-            function: { name: def.name, description: def.description, parameters: def.inputSchema },
-          }))
-          // Hermes already paid for its pre-loop prompt catalog, and Small-
-          // Model Mode has its own measured count cap. This weighted allowance
-          // is deliberately Normal-Mode native Agent policy only.
-          const budget = strategy === 'hermes_xml' || settings.smallModelMode
-            ? { defs: gatedDefs, keptNames: [] as string[], droppedNames: [] as string[], usedUnits: 0 }
-            : applySemanticOnlyBudget(
-                gatedDefs,
-                semanticNames,
-                deterministicOriginNames,
-                NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS,
-                wireDefinitionUnits,
-              )
-          const relevantDefs = budget.defs
-          const tools: ToolDefinition[] = relevantDefs.map(t => ({
-            type: 'function' as const,
-            function: { name: t.name, description: t.description, parameters: t.inputSchema },
-          }))
-          const gateSelectedNames = new Set(gatedDefs.map((t) => t.name))
-          const selectedNames = new Set(relevantDefs.map((t) => t.name))
-          log.warn('agent.tool_selection_measurement', {
-            event: 'agent_tool_selection_measurement',
-            provider: providerId,
-            model: modelToUse,
-            conversation_id: convId!,
-            step: stepNo,
-            available_count: availableDefs.length,
-            semantic_rank: semanticRank,
-            semantic_names: semanticNames,
-            semantic_only_names: semanticOnlyNames,
-            selected_semantic_only_names: semanticOnlyNames.filter((name) => selectedNames.has(name)),
-            ...deterministicProvenance,
-            routed_names: routedDefs.map((t) => t.name),
-            gated_out: routedDefs.filter((t) => !gateSelectedNames.has(t.name)).map((t) => t.name),
-            semantic_budget_limit_units: strategy === 'hermes_xml' || settings.smallModelMode
-              ? null
-              : NORMAL_AGENT_SEMANTIC_ONLY_BUDGET_UNITS,
-            semantic_budget_used_units: budget.usedUnits,
-            semantic_budget_kept: budget.keptNames,
-            semantic_budget_dropped: budget.droppedNames,
-            selected_names: relevantDefs.map((t) => t.name),
-            selected_definition_units: estimateTokens(JSON.stringify(tools)),
-          })
           // Same reason as the coding loop: the catalog rides as its own field
           // on the wire, so the message estimate the builder reported never saw
           // it and the meter read low by the whole catalog.
           if (convId) {
-            useSendSizeStore.getState().reportTools(convId, estimateTokens(JSON.stringify(tools)))
+            useSendSizeStore.getState().reportTools(convId, toolUnits)
           }
 
           const contextMeasurement = measureLogicalModelRequest({
@@ -1659,7 +1663,7 @@ export function useAgentChat() {
             modelContextLimit: agentCtx,
             effectiveSendWindow: sendWindow,
           })
-          log.warn('agent.context_measurement', contextMeasurement)
+          log.warn('agent.context_measurement', { ...contextMeasurement })
 
           // Aus den beiden Transporten abgeleitet statt abgeschrieben. Die
           // abgeschriebene Fassung kannte `doneReason` nicht, und ein Feld, das
@@ -1679,12 +1683,26 @@ export function useAgentChat() {
             if (!existingUsage || existingUsage.estimated) {
               const estPrompt =
                 estimateTokens(sendMessages.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n')) +
-                estimateTokens(JSON.stringify(tools))
+                toolUnits
               useChatStore.getState().updateMessageUsage(convId!, assistantMessage.id, {
                 promptTokens: estPrompt, completionTokens: 0, totalTokens: estPrompt, estimated: true,
               })
             }
           }
+          // Show the placeholder only while the finalized request is at the model.
+          const thinkingBlockId = uuid()
+          addBlock(runState, convId!, assistantMessage.id, {
+            id: thinkingBlockId, phase: 'thinking', content: 'Analyzing...',
+            timestamp: Date.now(),
+          })
+          let thinkingBlockRemoved = false
+          const dropThinkingBlock = () => {
+            if (thinkingBlockRemoved) return
+            thinkingBlockRemoved = true
+            removeBlock(runState, convId!, assistantMessage.id, thinkingBlockId)
+          }
+
+          try {
           if (providerId === 'ollama') {
             // Streaming path — parity with desktop Codex. Without this
             // the user stared at a frozen chat for 30-90 s while Gemma
@@ -1694,13 +1712,6 @@ export function useAgentChat() {
             // The thinking-indicator block is removed the moment ANY
             // token arrives, so the user sees the live answer instead
             // of the placeholder once the model starts producing.
-            let thinkingBlockRemoved = false
-            const dropThinkingBlock = () => {
-              if (!thinkingBlockRemoved) {
-                thinkingBlockRemoved = true
-                removeBlock(runState, convId!, assistantMessage.id, thinkingBlockId)
-              }
-            }
             // Connection-failure retry (David 2026-06-04): right after a VRAM
             // hand-off reloads the text model, the very next call can race the
             // still-warming model and die as "Agent error: Connection failed"
@@ -1805,7 +1816,6 @@ export function useAgentChat() {
                 throw thinkErr
               }
             }
-            dropThinkingBlock()
             turn = ollamaTurn
             // Ollama nennt den Grund `done_reason`; `lib/ollama-stream-tools.ts`
             // reicht ihn seit Fehler D durch.
@@ -1824,13 +1834,6 @@ export function useAgentChat() {
             // v2.5.3); a request that races that reload window dies as
             // "LM Studio: Request failed". Retry transient failures a couple
             // of times; a 4xx is deterministic and still surfaces.
-            let thinkingBlockRemoved = false
-            const dropThinkingBlock = () => {
-              if (!thinkingBlockRemoved) {
-                thinkingBlockRemoved = true
-                removeBlock(runState, convId!, assistantMessage.id, thinkingBlockId)
-              }
-            }
             const onLiveContent = (c: string) => {
               dropThinkingBlock()
               runState.content = c
@@ -1884,10 +1887,12 @@ export function useAgentChat() {
                 throw thinkErr
               }
             }
-            dropThinkingBlock()
             turn = providerTurn
             // Und jeder andere Transport nennt ihn `finish_reason`.
             turnFinishReason = providerTurn.finishReason
+          }
+          } finally {
+            dropThinkingBlock()
           }
 
           toolCalls = turn.toolCalls

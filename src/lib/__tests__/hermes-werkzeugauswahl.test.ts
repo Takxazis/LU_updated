@@ -203,16 +203,16 @@ describe('Beide Zweige benutzen dieselben Stellschrauben', () => {
     // (selectRelevantToolsAsync filtert `blocked` selbst), wohl aber die
     // Vergleichbarkeit der beiden Zweige.
     const t = quelle()
-    // Fenster fester Laenge hinter jedem Aufruf statt einer Klammer-Regex:
-    // ein nicht-gieriges `\)` haelt schon beim ersten `getAll()` an und der
-    // Waechter prueft dann nur den Anfang des Aufrufs.
+    // Die Werkzeugmenge und die gemeinsamen Stellschrauben werden VOR dem
+    // asynchronen Aufruf vorbereitet. Darum umfasst das Fenster jetzt den
+    // unmittelbaren Vorlauf und den Aufruf, statt nur nach vorne zu schauen.
     const stellen: number[] = []
     for (let i = t.indexOf('selectRelevantToolsAsync('); i !== -1; i = t.indexOf('selectRelevantToolsAsync(', i + 1)) {
       stellen.push(i)
     }
     expect(stellen).toHaveLength(2)
     for (const i of stellen) {
-      const fenster = t.slice(i, i + 400)
+      const fenster = t.slice(Math.max(0, i - 900), i + 400)
       expect(fenster).toContain('toolRegistry.getAll()')
       expect(fenster).toContain('toolMatchesCurated')
       expect(fenster).toContain('toolSelectionOpts(')

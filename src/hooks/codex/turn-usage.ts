@@ -1,5 +1,6 @@
 import { useChatStore } from '../../stores/chatStore'
 import { estimateTokens } from '../../lib/context-compaction'
+import { toolCatalogUnits } from '../../lib/tool-catalog-budget'
 import type { ChatMessage, ToolDefinition } from '../../api/providers/types'
 
 /**
@@ -52,7 +53,7 @@ export function seedEstimatedUsage(
   if (!existingUsage || existingUsage.estimated) {
     const estPrompt =
       estimateTokens(sendMessages.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n')) +
-      estimateTokens(JSON.stringify(tools))
+      toolCatalogUnits(tools)
     useChatStore.getState().updateMessageUsage(convId, messageId, {
       promptTokens: estPrompt, completionTokens: 0, totalTokens: estPrompt, estimated: true,
     })

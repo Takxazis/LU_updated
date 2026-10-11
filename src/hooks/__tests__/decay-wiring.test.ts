@@ -55,13 +55,15 @@ describe.each([
     expect(source).toMatch(/tokens: built\.promptTokens/)
   })
 
-  it('reports the tool catalog too, or the meter reads low by all of it', () => {
-    // The catalog is its own field on the wire, so the message estimate above
-    // cannot see it. It is picked after the build, which is why it arrives as
-    // a second call instead of riding in the report.
-    expect(source).toMatch(
-      /reportTools\(convId, estimateTokens\(JSON\.stringify\(tools\)\)\)/,
-    )
+  it('reports the same finalized catalog units the history budget reserved', () => {
+    // Native tool definitions ride in a separate wire field. The finalized
+    // catalog is sized once before compaction; the same value is subtracted
+    // from message history and then reported separately to the meter. This
+    // describe runs once for Codex and once for Agent, so one guard covers both.
+    expect(source).toContain('nativeToolUnits = toolCatalogUnits(nativeTools)')
+    expect(source).toContain('toolAwareHistoryAllowance(sendWindow, nativeToolUnits)')
+    expect(source).toContain('reportTools(convId, toolUnits)')
+    expect(source).not.toMatch(/reportTools\(convId, estimateTokens\(JSON\.stringify\(tools\)\)\)/)
   })
 
   it('leaves a decay row in the tool audit so support can see it', () => {
@@ -101,18 +103,22 @@ describe('useCodex keeps the working history whole for the store', () => {
 })
 
 describe('the builder runs before the model call, every step', () => {
-  it('useCodex builds inside the iteration loop, ahead of the transports', () => {
+  it('useCodex sizes the catalog, builds, then enters the native transport', () => {
+    const catalogAt = codex.indexOf('nativeToolUnits = toolCatalogUnits(nativeTools)')
     const buildAt = codex.indexOf('const built = buildRequestMessages(messages, {')
-    const nativeAt = codex.indexOf("if (strategy === 'native') {")
-    expect(buildAt).toBeGreaterThan(-1)
-    expect(buildAt).toBeLessThan(nativeAt)
+    const transportAt = codex.indexOf("if (providerId === 'ollama')")
+    expect(catalogAt).toBeGreaterThan(-1)
+    expect(buildAt).toBeGreaterThan(catalogAt)
+    expect(transportAt).toBeGreaterThan(buildAt)
   })
 
-  it('useAgentChat builds ahead of its transports too', () => {
+  it('useAgentChat sizes the catalog, builds, then enters the native transport', () => {
+    const catalogAt = agent.indexOf('nativeToolUnits = toolCatalogUnits(nativeTools)')
     const buildAt = agent.indexOf('const built = buildRequestMessages(agentMessages, {')
-    const nativeAt = agent.indexOf("if (strategy === 'native') {")
-    expect(buildAt).toBeGreaterThan(-1)
-    expect(buildAt).toBeLessThan(nativeAt)
+    const transportAt = agent.indexOf("if (providerId === 'ollama')")
+    expect(catalogAt).toBeGreaterThan(-1)
+    expect(buildAt).toBeGreaterThan(catalogAt)
+    expect(transportAt).toBeGreaterThan(buildAt)
   })
 })
 

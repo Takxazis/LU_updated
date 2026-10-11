@@ -76,9 +76,10 @@ import { selectRelevantTools, selectRelevantToolsAsync, SMALL_MODEL_MAX_TOOLS, g
 import { generateEmbeddings } from '../api/rag'
 import { truncateToolResult } from '../lib/truncate-tool-result'
 import { toolCallCapMs, raceWithToolTimeout, SHELL_EXECUTE_DEFAULT_TIMEOUT_MS } from '../lib/tool-timeout'
-import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
+import { getModelMaxTokens } from '../lib/context-compaction'
 import { buildRequestMessages, trimWorkingHistory, decayRestoredToolResult, isToolResult } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
+import { toolAwareHistoryAllowance, toolCatalogUnits } from '../lib/tool-catalog-budget'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1236,6 +1237,92 @@ export function useCodex() {
           smallModelMode: settings.smallModelMode,
           localBackend: sendsToALanBackend(providerId),
         })
+        let nativeTools: ToolDefinition[] = []
+        let nativeToolUnits = 0
+        let nativeCodexToolNames: string[] = []
+        let nativeRelevantDefNames: string[] = []
+        if (strategy === 'native') {
+          // Route on the USER's instruction, never on the newest user-role
+          // message (audit B6): steers, nudges and blocked-tool notes are
+          // pushed as role 'user', and routing on those swapped the tool list
+          // mid-run to whatever the harness happened to say last. The real
+          // instruction is the routing intent for the whole run.
+          const lastUserMsg = instruction
+          // CODEX_CATEGORIES filter: Codex is a CODING agent — screenshot,
+          // run_workflow etc. are distractions that pollute the tool list for
+          // small/3B models. Filter the registry by category BEFORE keyword
+          // routing. image/video are in the set since v2.5.3, but the keyword
+          // router below only surfaces them on creative intents, so plain
+          // coding turns keep the lean list.
+          // getAvailableTools, not getAll: a category the user set to 'blocked'
+          // must never reach the model. The keyword routers below drop blocked
+          // tools themselves, but the branch for a REMOTE model hands
+          // `codexTools` to the request untouched, so getAll() there meant a
+          // blocked category was offered and, since nothing re-checks the
+          // permission at execution time on this surface, actually ran. The
+          // hermes path never had the hole (toHermesToolDefs takes permissions),
+          // which is exactly the kind of per-schema drift the 2.6.3 matrix is
+          // looking for.
+          const codexToolsAll = toolRegistry.getAvailableTools(permissions).filter(
+            (t) => (CODEX_CATEGORIES as readonly string[]).includes(t.category),
+          )
+          // Code-Review Mode (B13): strip mutating tools so the model
+          // physically cannot fire them. Belt-and-braces with the
+          // system-prompt banner above — covers the case where the model
+          // ignores the instruction and tries anyway.
+          // Two reasons to strip the mutating tools: Code-Review Mode is on, or
+          // this turn was started by a read-only slash command. Belt-and-braces
+          // with the system prompt — covers the model ignoring the instruction
+          // and trying anyway.
+          const codexTools = effectiveReadOnly
+            ? codexToolsAll.filter((t) => allowedInReadOnlyTurn(t.name))
+            : codexToolsAll
+          // Tool-list sizing is a MODEL-STRENGTH decision (audit B3):
+          //  - Small-Model Mode: embedding router + hard cap, ≤6 tools. A
+          //    3B-8B model handed the full catalog degrades fast (narrates,
+          //    dumps raw JSON, stops after one step — the old regression,
+          //    LongFuncEval arXiv 2505.10570).
+          //  - Local default: keyword routing over the coding categories,
+          //    uselu parity. Kept lean on purpose; the keyword groups now
+          //    cover git/tests/background so those are reachable when asked.
+          //  - Cloud/remote model: the FULL coding catalog. A hosted model
+          //    handles 25+ tools fine (that is exactly what Claude Code
+          //    sends), and keyword-guessing its toolbox from message one
+          //    starved 30-minute runs of git_commit/run_tests/background
+          //    shell mid-way.
+          //
+          // gateCreateTools runs on ALL THREE, last: image_generate,
+          // video_generate and run_workflow are the one group a coding turn
+          // truly never wants, and the CODEX_CATEGORIES comment above has
+          // claimed since v2.5.3 that they "only surface when the keyword
+          // router sees a creative intent". That was true for local models and
+          // false for cloud ones, which got all three on every step: 6.186
+          // tokens instead of 4.223, measured 2026-08-12 against the model's
+          // own tokenizer. Nothing is removed, the keyword weiche just now
+          // decides on both paths.
+          const routedDefs = settings.smallModelMode
+            ? await selectRelevantToolsAsync(lastUserMsg, codexTools, permissions, {
+                embed: (texts) => generateEmbeddings(texts),
+                topN: 5,
+                embeddingThreshold: 6,
+                maxTools: SMALL_MODEL_MAX_TOOLS,
+              })
+            : !isLocalModelByName(activeModel)
+              ? codexTools
+              : selectRelevantTools(lastUserMsg, codexTools, permissions)
+          const relevantDefs = gateCreateTools(routedDefs, lastUserMsg, createGateOpened)
+          nativeTools = relevantDefs.map(t => ({
+            type: 'function' as const,
+            function: { name: t.name, description: t.description, parameters: t.inputSchema },
+          }))
+          nativeToolUnits = toolCatalogUnits(nativeTools)
+          nativeCodexToolNames = codexTools.map((t) => t.name)
+          nativeRelevantDefNames = relevantDefs.map((t) => t.name)
+        }
+
+        const historyAllowance = strategy === 'native'
+          ? toolAwareHistoryAllowance(sendWindow, nativeToolUnits)
+          : sendWindow
         let sendMessages: ChatMessage[] = messages.slice()
         let trimmedReadKeys: ReadonlySet<string> = NO_TRIMMED_KEYS
         try {
@@ -1245,9 +1332,9 @@ export function useCodex() {
           // moves every step is a prompt prefix that is never the same twice.
           // Whole messages are dropped here, never shortened: decay stays on
           // the send copy alone, so the store keeps every result complete.
-          messages = trimWorkingHistory(messages, sendWindow, { enabled: decayOn, hysteresis: decayOn }).messages
+          messages = trimWorkingHistory(messages, historyAllowance, { enabled: decayOn, hysteresis: decayOn }).messages
           const built = buildRequestMessages(messages, {
-            budgetTokens: sendWindow,
+            budgetTokens: historyAllowance,
             enabled: decayOn,
             hysteresis: decayOn,
             keyOf: (m) => guardKeyOfResult.get(m as unknown as object),
@@ -1327,96 +1414,27 @@ export function useCodex() {
         const liveContent = livePaint.feed
 
         if (strategy === 'native') {
-          // Route on the USER's instruction, never on the newest user-role
-          // message (audit B6): steers, nudges and blocked-tool notes are
-          // pushed as role 'user', and routing on those swapped the tool list
-          // mid-run to whatever the harness happened to say last. The real
-          // instruction is the routing intent for the whole run.
-          const lastUserMsg = instruction
-          // CODEX_CATEGORIES filter: Codex is a CODING agent — screenshot,
-          // run_workflow etc. are distractions that pollute the tool list for
-          // small/3B models. Filter the registry by category BEFORE keyword
-          // routing. image/video are in the set since v2.5.3, but the keyword
-          // router below only surfaces them on creative intents, so plain
-          // coding turns keep the lean list.
-          // getAvailableTools, not getAll: a category the user set to 'blocked'
-          // must never reach the model. The keyword routers below drop blocked
-          // tools themselves, but the branch for a REMOTE model hands
-          // `codexTools` to the request untouched, so getAll() there meant a
-          // blocked category was offered and, since nothing re-checks the
-          // permission at execution time on this surface, actually ran. The
-          // hermes path never had the hole (toHermesToolDefs takes permissions),
-          // which is exactly the kind of per-schema drift the 2.6.3 matrix is
-          // looking for.
-          const codexToolsAll = toolRegistry.getAvailableTools(permissions).filter(
-            (t) => (CODEX_CATEGORIES as readonly string[]).includes(t.category),
-          )
-          // Code-Review Mode (B13): strip mutating tools so the model
-          // physically cannot fire them. Belt-and-braces with the
-          // system-prompt banner above — covers the case where the model
-          // ignores the instruction and tries anyway.
-          // Two reasons to strip the mutating tools: Code-Review Mode is on, or
-          // this turn was started by a read-only slash command. Belt-and-braces
-          // with the system prompt — covers the model ignoring the instruction
-          // and trying anyway.
-          const codexTools = effectiveReadOnly
-            ? codexToolsAll.filter((t) => allowedInReadOnlyTurn(t.name))
-            : codexToolsAll
-          // Tool-list sizing is a MODEL-STRENGTH decision (audit B3):
-          //  - Small-Model Mode: embedding router + hard cap, ≤6 tools. A
-          //    3B-8B model handed the full catalog degrades fast (narrates,
-          //    dumps raw JSON, stops after one step — the old regression,
-          //    LongFuncEval arXiv 2505.10570).
-          //  - Local default: keyword routing over the coding categories,
-          //    uselu parity. Kept lean on purpose; the keyword groups now
-          //    cover git/tests/background so those are reachable when asked.
-          //  - Cloud/remote model: the FULL coding catalog. A hosted model
-          //    handles 25+ tools fine (that is exactly what Claude Code
-          //    sends), and keyword-guessing its toolbox from message one
-          //    starved 30-minute runs of git_commit/run_tests/background
-          //    shell mid-way.
-          //
-          // gateCreateTools runs on ALL THREE, last: image_generate,
-          // video_generate and run_workflow are the one group a coding turn
-          // truly never wants, and the CODEX_CATEGORIES comment above has
-          // claimed since v2.5.3 that they "only surface when the keyword
-          // router sees a creative intent". That was true for local models and
-          // false for cloud ones, which got all three on every step: 6.186
-          // tokens instead of 4.223, measured 2026-08-12 against the model's
-          // own tokenizer. Nothing is removed, the keyword weiche just now
-          // decides on both paths.
-          const routedDefs = settings.smallModelMode
-            ? await selectRelevantToolsAsync(lastUserMsg, codexTools, permissions, {
-                embed: (texts) => generateEmbeddings(texts),
-                topN: 5,
-                embeddingThreshold: 6,
-                maxTools: SMALL_MODEL_MAX_TOOLS,
-              })
-            : !isLocalModelByName(activeModel)
-              ? codexTools
-              : selectRelevantTools(lastUserMsg, codexTools, permissions)
-          const relevantDefs = gateCreateTools(routedDefs, lastUserMsg, createGateOpened)
-          const tools: ToolDefinition[] = relevantDefs.map(t => ({
-            type: 'function' as const,
-            function: { name: t.name, description: t.description, parameters: t.inputSchema },
-          }))
+          const tools = nativeTools
+          const toolUnits = nativeToolUnits
+
           // The catalog is part of what this step weighs and part of what the
-          // provider bills for it, and it is chosen here, after the request was
-          // built. Without this the meter showed the messages alone: 732 tokens
-          // on the first coding step against 2.400 on the wire.
+          // provider bills for it. It was finalized before request compaction so
+          // the message allowance already excludes these tool units. Reporting
+          // them separately keeps the meter on the full wire request; without
+          // this it showed 732 message tokens against 2.400 on the wire.
           if (convId) {
-            useSendSizeStore.getState().reportTools(convId, estimateTokens(JSON.stringify(tools)))
+            useSendSizeStore.getState().reportTools(convId, toolUnits)
           }
           void diagLog('iter-start', {
             iter: i,
             activeModel, modelToUse, strategy, providerId,
             allToolsCount: toolRegistry.getAll().length,
-            codexToolsCount: codexTools.length,
-            codexTools: codexTools.map(t => t.name),
-            relevantDefs: relevantDefs.map(t => t.name),
+            codexToolsCount: nativeCodexToolNames.length,
+            codexTools: nativeCodexToolNames,
+            relevantDefs: nativeRelevantDefNames,
             toolsSentCount: tools.length,
             messagesLen: sendMessages.length,
-            lastUserMsg: lastUserMsg.slice(0, 120),
+            lastUserMsg: instruction.slice(0, 120),
           })
 
           if (providerId === 'ollama') {
