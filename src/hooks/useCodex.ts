@@ -1636,7 +1636,10 @@ export function useCodex() {
           const runHermes = (opts: typeof hermesOpts) => streamProviderTurn(
             provider,
             modelToUse,
-            sendMessages.map(m => ({ role: m.role, content: m.content })),
+            // Keep the full logical message. The provider owns template
+            // normalization and decides which fields its wire format can render.
+            // Rebuilding role+content here dropped tool-call linkage and images.
+            sendMessages,
             opts,
             (_full, delta) => feedUI(splitter.feed(display.feed(delta))),
             // A prompt-transport backend can still answer on the NATIVE

@@ -452,9 +452,12 @@ describe('a stored tool call survives the rebuild of the history', () => {
     expect(chat).toContain('...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),')
   })
 
-  it('the prompt-transport send no longer strips the message down to role and content', () => {
-    const agent = src('hooks/useAgentChat.ts')
-    expect(agent).not.toContain('sendMessages.map(m => ({ role: m.role, content: m.content }))')
+  it('neither agent strips prompt-transport messages down to role and content', () => {
+    for (const hook of ['hooks/useAgentChat.ts', 'hooks/useCodex.ts']) {
+      const source = src(hook)
+      expect(source, `${hook} still strips prompt-transport message fields`)
+        .not.toContain('sendMessages.map(m => ({ role: m.role, content: m.content }))')
+    }
   })
 
   it('the coding agent writes it for the transport too', () => {
