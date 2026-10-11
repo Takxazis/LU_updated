@@ -58,6 +58,12 @@ export interface FsEntry {
 export interface FsListResult {
   entries: FsEntry[]
   count?: number
+  /** True when the backend stopped at its traversal/output cap. */
+  truncated?: boolean
+  /** Backend entry cap used for this listing. */
+  maxEntries?: number
+  /** Repository-noise directories pruned before traversal. */
+  skippedDirectories?: string[]
 }
 
 /** `fs_search` — one matching line inside one file. */

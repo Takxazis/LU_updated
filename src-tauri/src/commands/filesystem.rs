@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use base64::Engine;
-use glob::glob as glob_match;
+use glob::Pattern as GlobPattern;
 use once_cell::sync::Lazy;
 use regex::RegexBuilder;
 use walkdir::WalkDir;
@@ -622,6 +622,37 @@ pub(crate) fn reject_root_as_write_target(root: &Path, target: &Path) -> Result<
     Ok(())
 }
 
+const FILE_LIST_MAX_ENTRIES: usize = 500;
+const FILE_LIST_MAX_DEPTH: usize = 5;
+const FILE_LIST_DEFAULT_SKIPS: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".llama-build",
+    "dist",
+    "build",
+    "target",
+    "coverage",
+    ".cache",
+];
+
+/// Directories that a broad repository listing should not descend into.
+///
+/// The walk root itself is always allowed, so an explicit `path: ".git"`
+/// remains a legitimate request. Only matching directories encountered below
+/// a broader root such as `path: "."` are pruned before any of their children
+/// are read.
+fn is_file_list_default_skip(name: &std::ffi::OsStr) -> bool {
+    FILE_LIST_DEFAULT_SKIPS
+        .iter()
+        .any(|candidate| name.to_string_lossy().eq_ignore_ascii_case(candidate))
+}
+
+fn sorted_skipped_directories(mut skipped: Vec<String>) -> Vec<String> {
+    skipped.sort();
+    skipped.dedup();
+    skipped
+}
+
 fn file_meta(path: &Path) -> serde_json::Value {
     let meta = fs::metadata(path);
     let (size, modified, is_dir) = match meta {
@@ -868,20 +899,13 @@ pub fn fs_list(
     }
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
-    let max_entries = 500;
+    let mut skipped_directories: Vec<String> = Vec::new();
+    let mut truncated = false;
 
     if let Some(ref pat) = pattern {
         // The pattern is a second path channel and gets the same jail as `path`.
-        // Without this, `pattern: "../../.ssh/*"` listed the keys that
-        // `path: "../../.ssh"` refuses — and an ABSOLUTE pattern skipped the
-        // guessing entirely, because Path::join throws the base away when the
-        // joined component is absolute. glob 0.3 also follows `..` literally and
-        // matches dotfiles, so both had to be shut: reject the escape up front
-        // for a clear error, and re-check every match, since a glob result is a
-        // real path we never authorised.
         // Prefix / RootDir / ParentDir are exactly the components that make
-        // `join` discard or climb out of the base — including the Windows-only
-        // shapes ("\.ssh\*" keeps only the drive, "C:foo\*" replaces the lot).
+        // `join` discard or climb out of the base, including Windows shapes.
         {
             use std::path::Component;
             let escapes = Path::new(pat.as_str()).components().any(|c| {
@@ -891,21 +915,57 @@ pub fn fs_list(
                 return Err("Pattern escapes the allowed workspace".to_string());
             }
         }
-        let glob_pattern = dir.join(pat).to_string_lossy().to_string();
-        if let Ok(paths) = glob_match(&glob_pattern) {
-            for entry in paths.flatten() {
-                if entries.len() >= max_entries {
-                    break;
+
+        // glob::glob performs its own traversal, which cannot be pruned before
+        // entering .git/node_modules. Match the same relative pattern over the
+        // guarded walker instead so broad patterns such as **/* never read those
+        // trees in the first place.
+        let matcher = GlobPattern::new(pat)
+            .map_err(|e| format!("Invalid glob pattern: {e}"))?;
+        let walker = WalkDir::new(&dir)
+            .max_depth(FILE_LIST_MAX_DEPTH)
+            .into_iter()
+            .filter_entry(|entry| {
+                if entry.depth() == 0 || !entry.file_type().is_dir() {
+                    return true;
                 }
-                if contain_within(&dir, &entry).is_err() {
-                    continue;
+                if is_file_list_default_skip(entry.file_name()) {
+                    skipped_directories.push(entry.file_name().to_string_lossy().to_string());
+                    return false;
                 }
-                entries.push(file_meta(&entry));
+                true
+            });
+        for entry in walker.filter_map(|e| e.ok()) {
+            let relative = entry.path().strip_prefix(&dir).unwrap_or(entry.path());
+            if relative.as_os_str().is_empty() || !matcher.matches_path(relative) {
+                continue;
             }
+            if contain_within(&dir, entry.path()).is_err() {
+                continue;
+            }
+            if entries.len() >= FILE_LIST_MAX_ENTRIES {
+                truncated = true;
+                break;
+            }
+            entries.push(file_meta(entry.path()));
         }
     } else if recursive.unwrap_or(false) {
-        for entry in WalkDir::new(&dir).max_depth(5).into_iter().filter_map(|e| e.ok()) {
-            if entries.len() >= max_entries {
+        let walker = WalkDir::new(&dir)
+            .max_depth(FILE_LIST_MAX_DEPTH)
+            .into_iter()
+            .filter_entry(|entry| {
+                if entry.depth() == 0 || !entry.file_type().is_dir() {
+                    return true;
+                }
+                if is_file_list_default_skip(entry.file_name()) {
+                    skipped_directories.push(entry.file_name().to_string_lossy().to_string());
+                    return false;
+                }
+                true
+            });
+        for entry in walker.filter_map(|e| e.ok()) {
+            if entries.len() >= FILE_LIST_MAX_ENTRIES {
+                truncated = true;
                 break;
             }
             entries.push(file_meta(entry.path()));
@@ -913,14 +973,22 @@ pub fn fs_list(
     } else {
         let read_dir = fs::read_dir(&dir).map_err(|e| format!("Read dir: {}", os_error::english(&e)))?;
         for entry in read_dir.flatten() {
-            if entries.len() >= max_entries {
+            if entries.len() >= FILE_LIST_MAX_ENTRIES {
+                truncated = true;
                 break;
             }
             entries.push(file_meta(&entry.path()));
         }
     }
 
-    Ok(serde_json::json!({ "entries": entries, "count": entries.len() }))
+    let skipped_directories = sorted_skipped_directories(skipped_directories);
+    Ok(serde_json::json!({
+        "entries": entries,
+        "count": entries.len(),
+        "truncated": truncated,
+        "maxEntries": FILE_LIST_MAX_ENTRIES,
+        "skippedDirectories": skipped_directories,
+    }))
 }
 
 /// Walks up to eight directory levels and reads every file under a megabyte:
@@ -1429,6 +1497,87 @@ mod jail_adversarial_tests {
 /// "does this path stay inside the root" perfectly — and the root arrived from
 /// the WebView on every single call, so the jail was only ever as narrow as the
 /// string the caller picked for it.
+#[cfg(test)]
+mod file_list_garbage_guard_tests {
+    use super::*;
+    use std::fs;
+
+    fn workspace(tag: &str) -> crate::os_paths::TestDir {
+        let root = crate::os_paths::test_dir(&format!("file-list-guard-{tag}"));
+        allow_root_for_test(&root);
+        root
+    }
+
+    fn listed_paths(value: &serde_json::Value) -> Vec<String> {
+        value["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn recursive_repository_listing_prunes_generated_and_metadata_trees() {
+        let root = workspace("recursive");
+        for dir in [".git", "node_modules", ".llama-build", "dist", "build", "target", "coverage", ".cache"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("garbage.txt"), b"noise").unwrap();
+        }
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.ts"), b"ok").unwrap();
+
+        let out = fs_list(".".into(), Some(true), None, None, Some(root.to_string_lossy().to_string())).unwrap();
+        let listed = listed_paths(&out).join("
+");
+        assert!(listed.contains("main.ts"), "legitimate source missing: {listed}");
+        assert!(!listed.contains("garbage.txt"), "garbage tree leaked: {listed}");
+        assert_eq!(out["skippedDirectories"].as_array().unwrap().len(), 8);
+        assert_eq!(out["truncated"], false);
+    }
+
+    #[test]
+    fn broad_glob_uses_the_same_pruned_walker() {
+        let root = workspace("glob");
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".git/objects/secret.bin"), b"noise").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"ok").unwrap();
+
+        let out = fs_list(".".into(), None, Some("**/*".into()), None, Some(root.to_string_lossy().to_string())).unwrap();
+        let listed = listed_paths(&out).join("
+");
+        assert!(listed.contains("lib.rs"), "legitimate glob result missing: {listed}");
+        assert!(!listed.contains("secret.bin"), "glob entered .git: {listed}");
+        assert!(out["skippedDirectories"].to_string().contains(".git"));
+    }
+
+    #[test]
+    fn explicitly_requested_garbage_directory_remains_listable() {
+        let root = workspace("explicit");
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::write(root.join(".git/objects/visible.bin"), b"ok").unwrap();
+
+        let out = fs_list(".git".into(), Some(true), None, None, Some(root.to_string_lossy().to_string())).unwrap();
+        let listed = listed_paths(&out).join("
+");
+        assert!(listed.contains("visible.bin"), "explicit root was hidden: {listed}");
+    }
+
+    #[test]
+    fn listing_reports_when_the_entry_cap_truncates_output() {
+        let root = workspace("truncated");
+        for i in 0..=FILE_LIST_MAX_ENTRIES {
+            fs::write(root.join(format!("file-{i:04}.txt")), b"x").unwrap();
+        }
+
+        let out = fs_list(".".into(), None, Some("*.txt".into()), None, Some(root.to_string_lossy().to_string())).unwrap();
+        assert_eq!(out["count"], FILE_LIST_MAX_ENTRIES);
+        assert_eq!(out["truncated"], true);
+        assert_eq!(out["maxEntries"], FILE_LIST_MAX_ENTRIES);
+    }
+}
+
 #[cfg(test)]
 mod workspace_root_guard_tests {
     use super::*;

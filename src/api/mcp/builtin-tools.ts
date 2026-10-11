@@ -26,6 +26,7 @@ import { writeTodos, summarizeTodos } from '../../stores/todoStore'
 import { isMlxImageHost, generateMlxImageDataUrl, listMlxImageModels, type MlxImageModel } from '../mlx-image'
 import { getVideoStatus, listVideoModels, generateVideo as generateMlxVideo, getVideoProgress, cancelVideo, type VideoModel } from '../mlx-video'
 import { pathToFileUrl } from '../../lib/local-media-url'
+import { formatFileListForModel } from '../../lib/file-list-model-output'
 import { RETIRED_MUTATING_NAMES } from '../../lib/retired-tools'
 import { resolveMlxModel, defaultMlxImageModel } from '../../lib/mlx-model-match'
 import type { Runner } from '../agents/test-runner'
@@ -286,7 +287,8 @@ const BUILTIN_TOOLS: MCPToolDefinition[] = [
     description:
       'List directory contents. Returns name, isDir, size and full path per entry. '
       + 'Supports recursive=true and a glob pattern ("*.ts", "**/*.py"). '
-      + 'PREFER a specific pattern over recursing a whole home or drive, that is slow. '
+      + 'Broad listings are bounded for model context and may end with a truncation notice; '
+      + 'narrow path or pattern instead of recursing a whole repository. '
       + 'For content search use file_search.',
     inputSchema: {
       type: 'object',
@@ -737,9 +739,7 @@ async function executeFileList(args: ToolArgs, run?: AgentRunContext): Promise<s
     ...chatCtx(run),
   })
   if (Array.isArray(data.entries)) {
-    return data.entries
-      .map((e) => `${e.isDir ? '[DIR]' : ''} ${e.name} (${formatBytes(e.size)})  ${e.path}`)
-      .join('\n')
+    return formatFileListForModel(data, formatBytes)
   }
   return JSON.stringify(data)
 }
