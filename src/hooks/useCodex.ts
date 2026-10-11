@@ -83,7 +83,7 @@ import { toolCatalogUnits } from '../lib/tool-catalog-budget'
 import { contextBudgetPolicy } from '../lib/context-budget-policy'
 import { measureLogicalModelRequest } from '../lib/model-request-measurement'
 import { recordContextCalibration } from '../lib/context-calibration-recorder'
-import { createAgentRunDiagnostics } from '../lib/agent-run-diagnostics'
+import { createAgentRunDiagnostics, type AgentRunCompletionReason, type AgentRunCompletionStatus } from '../lib/agent-run-diagnostics'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1099,6 +1099,9 @@ export function useCodex() {
       conversationId: convId,
     })
 
+    let diagnosticsStatus: AgentRunCompletionStatus = 'completed'
+    let diagnosticsReason: AgentRunCompletionReason = 'model_completed'
+
     try {
       // Agent loop — max 20 iterations (legacy cap) AND AgentBudget cap,
       // whichever is tighter.
@@ -1174,6 +1177,8 @@ export function useCodex() {
         budget.addIteration()
         const bx = budget.exceeded()
         if (bx.kind !== 'none') {
+          diagnosticsStatus = 'halted'
+          diagnosticsReason = 'budget_exhausted'
           useChatStore.getState().updateMessageContent(
             convId!,
             assistantMsg.id,
@@ -1963,6 +1968,8 @@ export function useCodex() {
             convId ? openPlanGap(useTodoStore.getState().getTodos(convId)) : null,
           )
           if (cutoff && convId) {
+            diagnosticsStatus = 'halted'
+            diagnosticsReason = 'model_cutoff'
             void diagLog('turn-cut-off', { iter: i, reason: turnFinishReason })
             useChatStore.getState().updateMessageContent(
               convId,
@@ -2007,6 +2014,8 @@ export function useCodex() {
               { trimmedReadKeys },
             )
         if (batchVerdict.action === 'halt') {
+          diagnosticsStatus = 'halted'
+          diagnosticsReason = 'loop_guard_halt'
           void diagLog('loop-guard-halt', { iter: i, reason: batchVerdict.reason })
           const msg = `\n\n_(halted: ${batchVerdict.reason}. The model is looping. Try a stronger model for multi-step code tasks, or rephrase the instruction.)_`
           useChatStore.getState().updateMessageContent(convId, assistantMsg.id, fullContent + msg)
@@ -2421,6 +2430,8 @@ export function useCodex() {
           results.map((r) => ({ name: r.toolName, failed: r.status === 'failed', error: r.error, args: r.dispatchedArgs })),
         )
         if (failVerdict.action === 'halt') {
+          diagnosticsStatus = 'halted'
+          diagnosticsReason = 'loop_guard_halt'
           const msg = `\n\n_(halted: ${failVerdict.reason}. The model is looping. Try a stronger model for multi-step code tasks, or rephrase the instruction.)_`
           useChatStore.getState().updateMessageContent(convId, assistantMsg.id, fullContent + msg)
           addBlock({
@@ -2502,6 +2513,13 @@ export function useCodex() {
         message: errorText(err).slice(0, 400),
         status: httpStatusOf(err),
       })
+      if (errName === 'AbortError') {
+        diagnosticsStatus = 'stopped'
+        diagnosticsReason = 'user_stop'
+      } else {
+        diagnosticsStatus = 'failed'
+        diagnosticsReason = 'unknown_error'
+      }
       if (errName !== 'AbortError') {
         const parts: string[] = []
         if (code) parts.push(`[${code}]`)
@@ -2516,6 +2534,7 @@ export function useCodex() {
         if (/Failed to fetch|NetworkError|net::ERR/i.test(msg)) {
           hint = '\n\nHint: the Ollama server is unreachable. Is `ollama serve` running on localhost:11434?'
         } else if (code === 'tools_unsupported' || /does not support tools|tool.*not.*support/i.test(msg)) {
+          diagnosticsReason = 'tools_unsupported'
           markToolsUnsupported(modelToUse)
           hint = '\n\nHint: this model does not support tool calling, so Code mode cannot use it. Pick a model that supports tool calling (Qwen 3, Llama 3.1+, Gemma 4) or an LU Cloud model shown with the tools badge.'
         } else if (/timed out/i.test(msg)) {
@@ -2524,6 +2543,7 @@ export function useCodex() {
         // An empty wallet is not a crash and no retry fixes it. Replace the
         // status-code line with the plain explanation the other surfaces use.
         if (code === 'credits_exhausted') {
+          diagnosticsReason = 'credits_exhausted'
           loopHalt = 'out of credits'
           fullContent += `\n\n${CREDITS_EXHAUSTED_MESSAGE}\n\nThe work finished so far stays in this chat. Once you top up, send a new message naming only what is still left.`
           useChatStore.getState().updateMessageContent(convId, assistantMsg.id, fullContent)
@@ -2597,6 +2617,10 @@ export function useCodex() {
       // wipe the new run's aborter and reject its generating flag out from
       // under it, leaving it unstoppable through generationStore exactly
       // like the Agent-surface bug.
+      if (diagnosticsStatus === 'completed' && (abort.signal.aborted || isRunStopped(convId))) {
+        diagnosticsStatus = 'stopped'
+        diagnosticsReason = 'user_stop'
+      }
       const stillOwnsSlot = activeCodexRuns.get(convId) === runToken
       if (stillOwnsSlot) {
         useGenerationStore.getState().clearAborter(convId)
@@ -2630,6 +2654,11 @@ export function useCodex() {
         },
         [flushChatPersist, flushStagedPersist],
       )
+      if (stillOwnsSlot) {
+        log.warn('codex.run_diagnostics_summary', {
+          ...runDiagnostics.finalize({ status: diagnosticsStatus, reason: diagnosticsReason }),
+        })
+      }
 
       // ── Memory extraction (parity with Chat + Agent) ────────────────
       // After the turn lands a final answer, run the lightweight extractor

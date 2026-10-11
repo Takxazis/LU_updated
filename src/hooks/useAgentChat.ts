@@ -46,7 +46,7 @@ import { buildVisionFeedback } from '../api/vision-feedback'
 import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
 import { measureLogicalModelRequest } from '../lib/model-request-measurement'
 import { recordContextCalibration } from '../lib/context-calibration-recorder'
-import { createAgentRunDiagnostics } from '../lib/agent-run-diagnostics'
+import { createAgentRunDiagnostics, type AgentRunCompletionReason, type AgentRunCompletionStatus } from '../lib/agent-run-diagnostics'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
 import { toolCatalogUnits } from '../lib/tool-catalog-budget'
@@ -1335,6 +1335,8 @@ export function useAgentChat() {
       transport: strategy === 'native' ? 'native' : 'hermes_xml',
       conversationId: convId,
     })
+    let diagnosticsStatus: AgentRunCompletionStatus = 'completed'
+    let diagnosticsReason: AgentRunCompletionReason = 'model_completed'
     let stepNo = 0
     try {
       // ── Agent Loop ──────────────────────────────────────────
@@ -1359,6 +1361,8 @@ export function useAgentChat() {
         budget.addIteration()
         const exceed = budget.exceeded()
         if (exceed.kind !== 'none') {
+          diagnosticsStatus = 'halted'
+          diagnosticsReason = 'budget_exhausted'
           runState.content =
             (runState.content ? runState.content + '\n\n' : '') + budget.haltMessage()
           scheduleUIUpdate()
@@ -2375,6 +2379,8 @@ export function useAgentChat() {
             convId ? openPlanGap(useTodoStore.getState().getTodos(convId)) : null,
           )
           if (cutoff && convId) {
+            diagnosticsStatus = 'halted'
+            diagnosticsReason = 'model_cutoff'
             runState.content =
               (runState.content ? runState.content + '\n\n' : '') + `_(${cutoff})_`
             addBlock(runState, convId, assistantMessage.id, {
@@ -2460,6 +2466,8 @@ export function useAgentChat() {
               { trimmedReadKeys },
             )
         if (batchVerdict.action === 'halt') {
+          diagnosticsStatus = 'halted'
+          diagnosticsReason = 'loop_guard_halt'
           runState.content =
             (runState.content ? runState.content + '\n\n' : '') +
             `_(halted: ${batchVerdict.reason}. The model is looping. Try a stronger model for multi-step tasks, or rephrase the instruction.)_`
@@ -2860,6 +2868,8 @@ export function useAgentChat() {
           results.map((r) => ({ name: r.toolName, failed: r.status === 'failed', error: r.error, args: r.dispatchedArgs })),
         )
         if (failVerdict.action === 'halt') {
+          diagnosticsStatus = 'halted'
+          diagnosticsReason = 'loop_guard_halt'
           addBlock(runState, convId!, assistantMessage.id, {
             id: uuid(),
             phase: 'reflection',
@@ -2979,6 +2989,13 @@ export function useAgentChat() {
       }
 
     } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        diagnosticsStatus = 'stopped'
+        diagnosticsReason = 'user_stop'
+      } else {
+        diagnosticsStatus = 'failed'
+        diagnosticsReason = 'unknown_error'
+      }
       if ((err as Error).name !== 'AbortError') {
         const errorMsg = errorText(err) || 'Connection failed'
         // Bug B3 round 2: a refusal that produced nothing at all (the model's
@@ -2999,6 +3016,7 @@ export function useAgentChat() {
               : (runState.content.trim() || closingSummary())
           )
         } else if ((err as { code?: string })?.code === 'tools_unsupported' || errorMsg.includes('does not support tools')) {
+          diagnosticsReason = 'tools_unsupported'
           // G26: record the refusal so the layered resolution (toolStrategyFor)
           // routes the NEXT run through the prompt transport on a local
           // provider. Only LU Cloud is terminal here: the server already does
@@ -3018,6 +3036,7 @@ export function useAgentChat() {
             `This model does not support thinking mode. Disable the Think button or switch to a compatible model (Qwen 3, DeepSeek-R1, Gemma 4).`
           )
         } else if ((err as { code?: string })?.code === 'credits_exhausted') {
+          diagnosticsReason = 'credits_exhausted'
           loopHalt = 'out of credits'
           // No retry fixes an empty wallet, and on a long run this line is the
           // only thing left on screen once the dialog is dismissed. Name where
@@ -3039,6 +3058,7 @@ export function useAgentChat() {
           // this branch existed the run ended on "Agent error: unauthenticated"
           // or, on an opaque body, "Invalid API key for LU Cloud. Check
           // Settings > Providers." for a provider that has no API key field.
+          diagnosticsReason = 'signed_out'
           loopHalt = 'signed out of LU Cloud'
           const todos = useTodoStore.getState().getTodos(convId!)
           const done = todos.filter((t) => t.status === 'completed').length
@@ -3078,6 +3098,7 @@ export function useAgentChat() {
             (runState.content ? runState.content + '\n\n' : '') + errorMsg
           )
         } else if (sendRefusal) {
+          diagnosticsReason = 'template_refusal'
           // Bug B3 round 2, nebenbefund 3: a chat-tools turn in PLAIN chat
           // runs through this same executor, so the template's own Jinja
           // stack trace used to reach the user under the heading "Agent
@@ -3114,6 +3135,10 @@ export function useAgentChat() {
       // to false, and reject B's pending approvals, leaving the NEW run
       // unstoppable through generationStore (Stop button, sign-out, window
       // close, app quit) even though activeAgentRuns still pointed at it.
+      if (diagnosticsStatus === 'completed' && abort.signal.aborted) {
+        diagnosticsStatus = 'stopped'
+        diagnosticsReason = 'user_stop'
+      }
       const stillOwnsSlot = activeAgentRuns.get(convId) === runState
       if (stillOwnsSlot) {
         useGenerationStore.getState().clearAborter(convId)
@@ -3148,6 +3173,11 @@ export function useAgentChat() {
           useGenerationStore.getState().setGenerating(convId, false)
         }
       })
+      if (stillOwnsSlot) {
+        log.warn('agent.run_diagnostics_summary', {
+          ...runDiagnostics.finalize({ status: diagnosticsStatus, reason: diagnosticsReason }),
+        })
+      }
       // Drop the per-run workspace scope so standalone tool calls from
       // other tabs don't accidentally land in this chat's folder. Only when
       // this run still owns the shared mirror, so a Coding run that outlives

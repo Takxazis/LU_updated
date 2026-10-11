@@ -10,8 +10,11 @@ const codex = read('useCodex.ts')
 
 describe('shared agent run diagnostics recording wiring', () => {
   it('creates one surface-specific accumulator after run identity is known', () => {
-    expect(agent).toContain("import { createAgentRunDiagnostics } from '../lib/agent-run-diagnostics'")
-    expect(codex).toContain("import { createAgentRunDiagnostics } from '../lib/agent-run-diagnostics'")
+    for (const source of [agent, codex]) {
+      expect(source).toContain(
+        "import { createAgentRunDiagnostics, type AgentRunCompletionReason, type AgentRunCompletionStatus } from '../lib/agent-run-diagnostics'",
+      )
+    }
     expect(agent).toContain("surface: 'agent'")
     expect(codex).toContain("surface: 'codex'")
     for (const source of [agent, codex]) {
@@ -43,10 +46,30 @@ describe('shared agent run diagnostics recording wiring', () => {
     expect(codex.split('runDiagnostics.recordExecutionResults(results)')).toHaveLength(2)
   })
 
-  it('does not finalize or publish a summary in the recording-only patch', () => {
+  it('publishes one finalized summary per owning run after durability', () => {
+    expect(agent).toContain("log.warn('agent.run_diagnostics_summary'")
+    expect(codex).toContain("log.warn('codex.run_diagnostics_summary'")
     for (const source of [agent, codex]) {
-      expect(source).not.toContain('runDiagnostics.finalize(')
-      expect(source).not.toContain('run_diagnostics_summary')
+      expect(source.split('runDiagnostics.finalize(')).toHaveLength(2)
+      const durability = source.indexOf('await endTurnDurably(')
+      const finalize = source.indexOf('runDiagnostics.finalize(')
+      const ownership = source.lastIndexOf('if (stillOwnsSlot) {', finalize)
+      expect(durability).toBeGreaterThan(-1)
+      expect(finalize).toBeGreaterThan(durability)
+      expect(ownership).toBeGreaterThan(durability)
+      expect(finalize).toBeGreaterThan(ownership)
+    }
+  })
+
+  it('classifies budget, loop, cutoff, stop, and failures explicitly', () => {
+    for (const source of [agent, codex]) {
+      expect(source).toContain("diagnosticsReason = 'budget_exhausted'")
+      expect(source).toContain("diagnosticsReason = 'loop_guard_halt'")
+      expect(source).toContain("diagnosticsReason = 'model_cutoff'")
+      expect(source).toContain("diagnosticsReason = 'user_stop'")
+      expect(source).toContain("diagnosticsReason = 'unknown_error'")
+      expect(source).toContain("diagnosticsReason = 'tools_unsupported'")
+      expect(source).toContain("diagnosticsReason = 'credits_exhausted'")
     }
   })
 })
