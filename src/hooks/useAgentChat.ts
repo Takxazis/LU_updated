@@ -44,7 +44,8 @@ import { mediaCallSucceeded } from '../lib/media-result'
 import { summarizeTurn } from '../lib/turn-summary'
 import { buildVisionFeedback } from '../api/vision-feedback'
 import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
-import { measureLogicalModelRequest, measureTokenCalibration } from '../lib/model-request-measurement'
+import { measureLogicalModelRequest } from '../lib/model-request-measurement'
+import { recordContextCalibration } from '../lib/context-calibration-recorder'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
 import { toolCatalogUnits } from '../lib/tool-catalog-budget'
@@ -1654,6 +1655,33 @@ export function useAgentChat() {
           })
         }
 
+        const measurementTools = strategy === 'native' ? nativeTools : []
+        const contextMeasurement = measureLogicalModelRequest({
+          provider: providerId,
+          model: modelToUse,
+          conversationId: convId!,
+          step: stepNo,
+          messages: sendMessages,
+          tools: measurementTools,
+          modelContextLimit: agentCtx,
+          effectiveSendWindow: sendWindow,
+        })
+        log.warn('agent.context_measurement', { ...contextMeasurement })
+        const recordCalibration = (actualPromptUnits?: number) => {
+          if (!actualPromptUnits) return
+          log.warn('agent.context_calibration', {
+            conversation_id: convId!,
+            step: stepNo,
+            ...recordContextCalibration({
+              provider: providerId,
+              model: modelToUse,
+              transport: strategy === 'native' ? 'native' : 'hermes_xml',
+              estimatedPromptUnits: contextMeasurement.estimated_total_units,
+              actualPromptUnits,
+            }),
+          })
+        }
+
         if (strategy === 'native') {
           const tools = nativeTools
           const toolUnits = nativeToolUnits
@@ -1664,18 +1692,6 @@ export function useAgentChat() {
           if (convId) {
             useSendSizeStore.getState().reportTools(convId, toolUnits)
           }
-
-          const contextMeasurement = measureLogicalModelRequest({
-            provider: providerId,
-            model: modelToUse,
-            conversationId: convId!,
-            step: stepNo,
-            messages: sendMessages,
-            tools,
-            modelContextLimit: agentCtx,
-            effectiveSendWindow: sendWindow,
-          })
-          log.warn('agent.context_measurement', { ...contextMeasurement })
 
           // Aus den beiden Transporten abgeleitet statt abgeschrieben. Die
           // abgeschriebene Fassung kannte `doneReason` nicht, und ein Feld, das
@@ -1921,18 +1937,7 @@ export function useAgentChat() {
               totalTokens: (turn.promptEvalCount || 0) + (turn.evalCount || 0),
               estimated: false,
             })
-            if (turn.promptEvalCount) {
-              log.warn('agent.context_calibration', {
-                provider: providerId,
-                model: modelToUse,
-                conversation_id: convId!,
-                step: stepNo,
-                ...measureTokenCalibration(
-                  contextMeasurement.estimated_total_units,
-                  turn.promptEvalCount,
-                ),
-              })
-            }
+            recordCalibration(turn.promptEvalCount)
           }
           // Native thinking field (Ollama; LU Cloud reasoning_content)
           if (turn.thinking) turnThinking = turn.thinking
@@ -2026,6 +2031,15 @@ export function useAgentChat() {
           // Prompt-Transport kann den Zug genauso mitten im `<tool_call>`
           // abschneiden, und dann steht hier ebenfalls kein Werkzeugaufruf.
           turnFinishReason = hermesTurn.finishReason
+          if (hermesTurn.promptEvalCount || hermesTurn.evalCount) {
+            useChatStore.getState().updateMessageUsage(convId!, assistantMessage.id, {
+              promptTokens: hermesTurn.promptEvalCount || 0,
+              completionTokens: hermesTurn.evalCount || 0,
+              totalTokens: (hermesTurn.promptEvalCount || 0) + (hermesTurn.evalCount || 0),
+              estimated: false,
+            })
+          }
+          recordCalibration(hermesTurn.promptEvalCount)
           if (hermesTurn.thinking) {
             turnThinking = turnThinking
               ? `${turnThinking}\n\n${hermesTurn.thinking}`

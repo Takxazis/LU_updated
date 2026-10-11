@@ -81,6 +81,8 @@ import { buildRequestMessages, trimWorkingHistory, decayRestoredToolResult, isTo
 import { effectiveSendWindow } from '../lib/send-window'
 import { toolCatalogUnits } from '../lib/tool-catalog-budget'
 import { contextBudgetPolicy } from '../lib/context-budget-policy'
+import { measureLogicalModelRequest } from '../lib/model-request-measurement'
+import { recordContextCalibration } from '../lib/context-calibration-recorder'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1438,6 +1440,33 @@ export function useCodex() {
         // old content over it.
         // Ein Puffer, drei Transporte, ein Bild pro Zeichenrunde — und ein
         // settle(), das ein wartendes Bild loescht: hooks/codex/live-paint.ts.
+        const measurementTools = strategy === 'native' ? nativeTools : []
+        const contextMeasurement = measureLogicalModelRequest({
+          provider: providerId,
+          model: modelToUse,
+          conversationId: convId!,
+          step: i + 1,
+          messages: sendMessages,
+          tools: measurementTools,
+          modelContextLimit: numCtx,
+          effectiveSendWindow: sendWindow,
+        })
+        log.warn('codex.context_measurement', { ...contextMeasurement })
+        const recordCalibration = (actualPromptUnits?: number) => {
+          if (!actualPromptUnits) return
+          log.warn('codex.context_calibration', {
+            conversation_id: convId!,
+            step: i + 1,
+            ...recordContextCalibration({
+              provider: providerId,
+              model: modelToUse,
+              transport: strategy === 'native' ? 'native' : 'hermes_xml',
+              estimatedPromptUnits: contextMeasurement.estimated_total_units,
+              actualPromptUnits,
+            }),
+          })
+        }
+
         const livePaint = createLivePaint({
           suppress: (c) => echoRetriesRemaining > 0 && isSystemPromptEcho(c),
           prefix: () => fullContent,
@@ -1530,6 +1559,7 @@ export function useCodex() {
             turnContent = turn.content || ''
             turnFinishReason = turn.doneReason
             reportTurnUsage(convId!, assistantMsg.id, turn)
+            recordCalibration(turn.promptEvalCount)
             void diagLog('streamWithTools-return', {
               iter: i,
               toolCallsCount: toolCalls.length,
@@ -1579,6 +1609,7 @@ export function useCodex() {
             turnContent = turn.content || ''
             turnFinishReason = turn.finishReason
             reportTurnUsage(convId!, assistantMsg.id, turn)
+            recordCalibration(turn.promptEvalCount)
             if (keepThinking && turn.thinking) {
               thinkingContent += (thinkingContent ? '\n\n' : '') + turn.thinking
               useChatStore.getState().updateMessageThinking(convId!, assistantMsg.id, thinkingContent)
@@ -1683,6 +1714,8 @@ export function useCodex() {
           // abschneiden, und dann steht hier ebenfalls kein Werkzeugaufruf.
           // Gleiche Stelle wie in useAgentChat.
           turnFinishReason = hermesTurn.finishReason
+          reportTurnUsage(convId!, assistantMsg.id, hermesTurn)
+          recordCalibration(hermesTurn.promptEvalCount)
           if (keepThinking && hermesTurn.thinking) {
             thinkingContent += (thinkingContent ? '\n\n' : '') + hermesTurn.thinking
             useChatStore.getState().updateMessageThinking(convId!, assistantMsg.id, thinkingContent)
