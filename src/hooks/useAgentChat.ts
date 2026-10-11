@@ -47,7 +47,8 @@ import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
 import { measureLogicalModelRequest, measureTokenCalibration } from '../lib/model-request-measurement'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
-import { toolAwareHistoryAllowance, toolCatalogUnits } from '../lib/tool-catalog-budget'
+import { toolCatalogUnits } from '../lib/tool-catalog-budget'
+import { contextBudgetPolicy } from '../lib/context-budget-policy'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1565,9 +1566,20 @@ export function useAgentChat() {
           })
         }
 
-        const historyAllowance = strategy === 'native'
-          ? toolAwareHistoryAllowance(sendWindow, nativeToolUnits)
-          : sendWindow
+        const budgetPolicy = contextBudgetPolicy({
+          provider: providerId,
+          model: modelToUse,
+          transport: strategy === 'native' ? 'native' : 'hermes_xml',
+          sendWindow,
+          nativeToolUnits,
+        })
+        const historyAllowance = budgetPolicy.calibratedHistoryAllowance
+        log.warn('agent.context_budget_policy', {
+          event: 'agent_context_budget_policy',
+          conversation_id: convId!,
+          step: stepNo,
+          ...budgetPolicy,
+        })
         let sendMessages: ChatMessage[] = agentMessages.slice()
         let trimmedReadKeys: ReadonlySet<string> = NO_TRIMMED_KEYS
         try {

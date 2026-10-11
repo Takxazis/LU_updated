@@ -6,13 +6,16 @@ const read = (file: string) => readFileSync(resolve(process.cwd(), 'src/hooks', 
 
 function expectNativeCatalogBeforeBuild(source: string, historyName: string): void {
   const catalogAt = source.indexOf('nativeToolUnits = toolCatalogUnits(nativeTools)')
-  const allowanceAt = source.indexOf("const historyAllowance = strategy === 'native'")
+  const policyAt = source.indexOf('const budgetPolicy = contextBudgetPolicy({')
+  const allowanceAt = source.indexOf('const historyAllowance = budgetPolicy.calibratedHistoryAllowance')
   const trimAt = source.indexOf(`trimWorkingHistory(${historyName}, historyAllowance`)
   const buildAt = source.indexOf('budgetTokens: historyAllowance')
   expect(catalogAt).toBeGreaterThan(-1)
-  expect(allowanceAt).toBeGreaterThan(catalogAt)
+  expect(policyAt).toBeGreaterThan(catalogAt)
+  expect(allowanceAt).toBeGreaterThan(policyAt)
   expect(trimAt).toBeGreaterThan(allowanceAt)
   expect(buildAt).toBeGreaterThan(trimAt)
+  expect(source.slice(policyAt, allowanceAt)).toContain('nativeToolUnits,')
 }
 
 describe('native catalog budgeting wiring', () => {

@@ -61,7 +61,9 @@ describe.each([
     // from message history and then reported separately to the meter. This
     // describe runs once for Codex and once for Agent, so one guard covers both.
     expect(source).toContain('nativeToolUnits = toolCatalogUnits(nativeTools)')
-    expect(source).toContain('toolAwareHistoryAllowance(sendWindow, nativeToolUnits)')
+    expect(source).toContain('const budgetPolicy = contextBudgetPolicy({')
+    expect(source).toContain('nativeToolUnits,')
+    expect(source).toContain('const historyAllowance = budgetPolicy.calibratedHistoryAllowance')
     expect(source).toContain('reportTools(convId, toolUnits)')
     expect(source).not.toMatch(/reportTools\(convId, estimateTokens\(JSON\.stringify\(tools\)\)\)/)
   })
@@ -123,13 +125,18 @@ describe('the builder runs before the model call, every step', () => {
 })
 
 describe('the prompt-transport path does not count its catalog twice', () => {
-  it('useCodex zeroes the catalog where the tools become a message', () => {
-    // buildHermesToolPrompt writes the catalog INTO messages[0], on the working
-    // array as well, so from the next step on the message estimate carries it.
-    const promptAt = codex.indexOf('const hermesSystem = buildHermesToolPrompt(')
+  it('useCodex zeroes the catalog after embedding it before compaction', () => {
+    // The prompt catalog is finalized into messages[0] before policy and
+    // compaction. The meter still reports zero separate tool units because
+    // those bytes are already part of the message estimate.
+    const promptAt = codex.indexOf('content: buildHermesToolPrompt(hermesTools)')
+    const policyAt = codex.indexOf('const budgetPolicy = contextBudgetPolicy({')
+    const trimAt = codex.indexOf('trimWorkingHistory(messages, historyAllowance')
     const zeroAt = codex.indexOf('reportTools(convId, 0)')
     expect(promptAt).toBeGreaterThan(-1)
-    expect(zeroAt).toBeGreaterThan(promptAt)
+    expect(policyAt).toBeGreaterThan(promptAt)
+    expect(trimAt).toBeGreaterThan(policyAt)
+    expect(zeroAt).toBeGreaterThan(trimAt)
   })
 
   it('useAgentChat builds its hermes prompt into the system message up front', () => {

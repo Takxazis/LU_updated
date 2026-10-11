@@ -79,7 +79,8 @@ import { toolCallCapMs, raceWithToolTimeout, SHELL_EXECUTE_DEFAULT_TIMEOUT_MS } 
 import { getModelMaxTokens } from '../lib/context-compaction'
 import { buildRequestMessages, trimWorkingHistory, decayRestoredToolResult, isToolResult } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
-import { toolAwareHistoryAllowance, toolCatalogUnits } from '../lib/tool-catalog-budget'
+import { toolCatalogUnits } from '../lib/tool-catalog-budget'
+import { contextBudgetPolicy } from '../lib/context-budget-policy'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1320,9 +1321,41 @@ export function useCodex() {
           nativeRelevantDefNames = relevantDefs.map((t) => t.name)
         }
 
-        const historyAllowance = strategy === 'native'
-          ? toolAwareHistoryAllowance(sendWindow, nativeToolUnits)
-          : sendWindow
+        // Finalize the prompt-transport catalog before budgeting. Its catalog
+        // rides inside the system message, so compaction must see those bytes on
+        // the first step as well as every later one.
+        if (strategy !== 'native') {
+          const hermesTools = gateCreateTools(
+            toolRegistry.toHermesToolDefs(permissions), instruction, createGateOpened,
+          ).filter(
+            (t) => {
+              const def = toolRegistry.getToolByName(t.name)
+              if (!def) return true
+              if (!(CODEX_CATEGORIES as readonly string[]).includes(def.category)) return false
+              if (effectiveReadOnly && !allowedInReadOnlyTurn(t.name)) return false
+              return true
+            },
+          )
+          messages[0] = {
+            role: 'system',
+            content: buildHermesToolPrompt(hermesTools) + `\n\n${systemPrompt}`,
+          }
+        }
+
+        const budgetPolicy = contextBudgetPolicy({
+          provider: providerId,
+          model: modelToUse,
+          transport: strategy === 'native' ? 'native' : 'hermes_xml',
+          sendWindow,
+          nativeToolUnits,
+        })
+        const historyAllowance = budgetPolicy.calibratedHistoryAllowance
+        log.warn('codex.context_budget_policy', {
+          event: 'codex_context_budget_policy',
+          conversation_id: convId!,
+          step: i + 1,
+          ...budgetPolicy,
+        })
         let sendMessages: ChatMessage[] = messages.slice()
         let trimmedReadKeys: ReadonlySet<string> = NO_TRIMMED_KEYS
         try {
@@ -1552,35 +1585,10 @@ export function useCodex() {
             }
           }
         } else {
-          // Hermes-XML fallback — also restrict tools to coding categories
-          // so the model doesn't see image_generate / screenshot etc.
-          // Same review-mode filter as the native path (B13), and the same
-          // create-tool gate: this path carries the weakest models in the
-          // fleet and was the one still shipping all three generators in every
-          // prompt, the exact catalog length LongFuncEval says they choke on.
-          // `instruction`, not the newest user-role message: same reason as the
-          // native path above, steers and nudges are pushed as role 'user'.
-          const hermesTools = gateCreateTools(
-            toolRegistry.toHermesToolDefs(permissions), instruction, createGateOpened,
-          ).filter(
-            (t) => {
-              const def = toolRegistry.getToolByName(t.name)
-              if (!def) return true
-              if (!(CODEX_CATEGORIES as readonly string[]).includes(def.category)) return false
-              if (effectiveReadOnly && !allowedInReadOnlyTurn(t.name)) return false
-              return true
-            },
-          )
-          const hermesSystem = buildHermesToolPrompt(hermesTools) + `\n\n${systemPrompt}`
-          // Prompt transport: the catalog IS a message here, so the message
-          // estimate of the next step already carries it. Counting it a second
-          // time as a catalog would be this fix undoing itself.
+          // Hermes-XML fallback. The final catalog was embedded in the
+          // system message before policy and compaction, so the built send copy
+          // already contains exactly the prompt-transport payload.
           if (convId) useSendSizeStore.getState().reportTools(convId, 0)
-          // Both arrays: the working one so the NEXT step's budget still
-          // counts the hermes tool prompt, the send one because that is what
-          // actually goes out.
-          messages[0] = { role: 'system', content: hermesSystem }
-          sendMessages[0] = messages[0]
           // Streamed prompt-transport turn (David 2026-07-31): prose renders
           // token by token while the display filter keeps <tool_call> XML
           // from ever flashing into the bubble. The parse below still runs
