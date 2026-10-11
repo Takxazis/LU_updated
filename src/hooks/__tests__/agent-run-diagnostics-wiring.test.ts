@@ -41,9 +41,16 @@ describe('shared agent run diagnostics recording wiring', () => {
     }
   })
 
-  it('records finalized executor results exactly once per surface', () => {
-    expect(agent.split('runDiagnostics.recordExecutionResults(results)')).toHaveLength(2)
-    expect(codex.split('runDiagnostics.recordExecutionResults(results)')).toHaveLength(2)
+  it('records each finalized executor batch once, before per-result projection', () => {
+    for (const source of [agent, codex]) {
+      expect(source.split('runDiagnostics.recordExecutionResults(results)')).toHaveLength(2)
+      const execute = source.indexOf('const results = await executeParallel(requests')
+      const record = source.indexOf('runDiagnostics.recordExecutionResults(results)', execute)
+      const project = source.indexOf('for (const entry of batch)', record)
+      expect(execute).toBeGreaterThan(-1)
+      expect(record).toBeGreaterThan(execute)
+      expect(project).toBeGreaterThan(record)
+    }
   })
 
   it('publishes one finalized summary per owning run after durability', () => {

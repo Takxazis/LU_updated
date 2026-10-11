@@ -2664,14 +2664,15 @@ export function useAgentChat() {
           abortSignal: abort.signal,
         })
 
+        runDiagnostics.recordExecutionResults(results)
+
         // Apply results back onto blocks + memory + LLM history.
         for (const entry of batch) {
           const result = results.find((r) => r.id === entry.ac.id)
           if (!result) continue
           applyResultToToolCall(entry.ac, result)
-          runDiagnostics.recordExecutionResults(results)
 
-        // Over-loop accounting (David 2026-06-04): remember every executed call
+          // Over-loop accounting (David 2026-06-04): remember every executed call
           // (so an identical repeat is skipped) and count successful media gens
           // against the per-turn cap that stops "13× the same cat".
           executedCallKeys.add(callKey(entry.tc))
