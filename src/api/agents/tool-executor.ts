@@ -413,6 +413,21 @@ async function runSingle(
         schemaValidated,
       })
     }
+    if (toolResultIsFailure(result)) {
+      return finalize({
+        id: req.id,
+        toolName: req.toolName,
+        status: 'failed',
+        result,
+        error: result,
+        dispatchedArgs,
+        argsHash,
+        sideEffectKey,
+        startedAt,
+        cacheHit: false,
+        schemaValidated,
+      })
+    }
     return finalize({
       id: req.id,
       toolName: req.toolName,

@@ -38,6 +38,10 @@ const FEHLERFORM = new RegExp(
     'Error\\s*[:(]' +
     // `Refused: this turn is read-only …`
     '|Refused:' +
+    // Dynamic MCP wrappers return these as ordinary text instead of throwing.
+    '|Unknown\\s+tool:' +
+    '|Invalid\\s+arguments:' +
+    '|\\d+\\s+validation\\s+errors?\\s+for\\s+call\\[' +
     // `Web search failed:` · `Image generation failed:` · `git_commit failed (exit 1)`
     '|[A-Za-z][\\w .\'"-]{0,40}\\bfailed\\b\\s*[:(]' +
     // `run_tests: could not detect …` · `pr_resume: unparseable gh output …`

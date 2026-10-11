@@ -217,6 +217,49 @@ describe('tool-executor — failures', () => {
   })
 })
 
+describe('tool-executor — semantic result failures', () => {
+  it.each([
+    'Unknown tool: godot/skeleton3d_add_bone. Catalog size: 28.',
+    'Invalid arguments: tool_name is required',
+    '3 validation errors for call[node_set_property]\npath\n  Missing required argument',
+    'Error: backend unavailable',
+  ])('classifies returned failure text before audit and downstream consumers: %s', async (result) => {
+    const audit: Parameters<NonNullable<ExecutorRuntime['recordAudit']>>[0][] = []
+    const runtime = makeRuntime({
+      tools: { semantic_fail: { executor: async () => result } },
+      recordAudit: (entry) => audit.push(entry),
+    })
+
+    const out = await executeParallel([req('semantic-1', 'semantic_fail')], runtime)
+
+    expect(out[0]).toMatchObject({
+      status: 'failed',
+      result,
+      error: result,
+    })
+    expect(audit.at(-1)).toMatchObject({
+      kind: 'complete',
+      status: 'failed',
+      error: result,
+    })
+  })
+
+  it.each([
+    'Bone_00 created successfully',
+    '{"has_more":false,"nodes":[]}',
+    'No matching files found.',
+  ])('keeps ordinary returned text completed: %s', async (result) => {
+    const runtime = makeRuntime({
+      tools: { semantic_ok: { executor: async () => result } },
+    })
+
+    const out = await executeParallel([req('semantic-2', 'semantic_ok')], runtime)
+
+    expect(out[0]).toMatchObject({ status: 'completed', result })
+    expect(out[0].error).toBeUndefined()
+  })
+})
+
 describe('tool-executor — cache + approval', () => {
   it('returns cached result without invoking executor', async () => {
     const exec = vi.fn(async () => 'fresh')

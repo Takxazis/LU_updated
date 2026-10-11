@@ -43,6 +43,9 @@ describe('unsere eigenen Fehlerformen werden erkannt', () => {
     'Refused: this turn is read-only (/review, Code-Review Mode or Plan mode).',
     'run_tests: could not detect a test runner. Pass `command` or `runner`.',
     'pr_resume: unparseable gh output (SyntaxError)',
+    'Unknown tool: godot/skeleton3d_add_bone. Catalog size: 28.',
+    'Invalid arguments: tool_name is required',
+    '3 validation errors for call[node_set_property]\npath\n  Missing required argument',
   ]
   it.each(echt)('%s gilt als Fehlschlag', (t) => expect(toolResultIsFailure(t)).toBe(true))
 
@@ -52,6 +55,8 @@ describe('unsere eigenen Fehlerformen werden erkannt', () => {
     // Der gefaehrliche Fall: „failed" MITTEN im Ergebnis, nicht am Anfang.
     '1. Warum das Projekt scheiterte\n   https://example.org\n   The mission failed: a retrospective.',
     'On branch main\nnothing to commit, working tree clean',
+    'The documentation mentions Unknown tool: as an example, not an execution result.',
+    'Validation errors for call[node_set_property] are described below, but this result does not begin with a count.',
     '',
   ]
   it.each(erfolge)('%s gilt als Erfolg', (t) => expect(toolResultIsFailure(t)).toBe(false))

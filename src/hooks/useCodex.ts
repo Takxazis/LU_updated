@@ -84,6 +84,7 @@ import { contextBudgetPolicy } from '../lib/context-budget-policy'
 import { measureLogicalModelRequest } from '../lib/model-request-measurement'
 import { recordContextCalibration } from '../lib/context-calibration-recorder'
 import { createAgentRunDiagnostics, type AgentRunCompletionReason, type AgentRunCompletionStatus } from '../lib/agent-run-diagnostics'
+import { createCompletionIntegrityTracker } from '../lib/completion-integrity'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1098,6 +1099,7 @@ export function useCodex() {
       transport: strategy === 'native' ? 'native' : 'hermes_xml',
       conversationId: convId,
     })
+    const completionIntegrity = createCompletionIntegrityTracker()
 
     let diagnosticsStatus: AgentRunCompletionStatus = 'completed'
     let diagnosticsReason: AgentRunCompletionReason = 'model_completed'
@@ -1921,6 +1923,33 @@ export function useCodex() {
         // (only strong "is complete / all tests pass / committed" phrases, not
         // forward-looking "to complete the fix") so we err toward nudging.
         if (toolCalls.length === 0) {
+          const integrity = completionIntegrity.noToolsVerdict()
+          if (integrity.action === 'recover') {
+            if (turnContent.trim()) {
+              messages.push({ role: 'assistant', content: turnContent })
+            }
+            messages.push({ role: 'user', content: integrity.message })
+            addBlock({
+              id: uuid(),
+              phase: 'reflection',
+              content: `Completion check requested recovery (${integrity.attempt}).`,
+              timestamp: Date.now(),
+            })
+            continue
+          }
+          if (integrity.action === 'halt') {
+            diagnosticsStatus = 'halted'
+            diagnosticsReason = 'loop_guard_halt'
+            fullContent = fullContent ? `${fullContent}\n\n${integrity.message}` : integrity.message
+            useChatStore.getState().updateMessageContent(convId, assistantMsg.id, fullContent)
+            addBlock({
+              id: uuid(),
+              phase: 'reflection',
+              content: 'Completion check halted an unverified success claim.',
+              timestamp: Date.now(),
+            })
+            break
+          }
           // Steckengeblieben oder fertig — drei Muster ueber denselben Text und
           // ihre Fehlalarm-Geschichte: hooks/codex/stall-verdict.ts.
           const { nudgeWorthy } = codexStallVerdict(turnContent, fullContent)
@@ -2281,6 +2310,7 @@ export function useCodex() {
         })
 
         runDiagnostics.recordExecutionResults(results)
+        completionIntegrity.recordExecutionResults(results)
         void diagLog('executeParallel-done', {
           iter: i,
           results: results.map(r => ({ tool: r.toolName, status: r.status, error: r.error?.slice(0,200), hint: r.errorHint?.slice(0,200), resultHead: r.result?.slice(0,200) })),

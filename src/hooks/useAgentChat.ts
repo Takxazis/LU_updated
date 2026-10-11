@@ -47,6 +47,7 @@ import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
 import { measureLogicalModelRequest } from '../lib/model-request-measurement'
 import { recordContextCalibration } from '../lib/context-calibration-recorder'
 import { createAgentRunDiagnostics, type AgentRunCompletionReason, type AgentRunCompletionStatus } from '../lib/agent-run-diagnostics'
+import { createCompletionIntegrityTracker } from '../lib/completion-integrity'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
 import { toolCatalogUnits } from '../lib/tool-catalog-budget'
@@ -1335,6 +1336,7 @@ export function useAgentChat() {
       transport: strategy === 'native' ? 'native' : 'hermes_xml',
       conversationId: convId,
     })
+    const completionIntegrity = createCompletionIntegrityTracker()
     let diagnosticsStatus: AgentRunCompletionStatus = 'completed'
     let diagnosticsReason: AgentRunCompletionReason = 'model_completed'
     let stepNo = 0
@@ -2259,6 +2261,33 @@ export function useAgentChat() {
           }
         }
         if (isFinalTurn) {
+          const integrity = completionIntegrity.noToolsVerdict()
+          if (integrity.action === 'recover') {
+            if (turnContent.trim()) {
+              agentMessages.push({ role: 'assistant', content: turnContent })
+            }
+            agentMessages.push({ role: 'user', content: integrity.message })
+            addBlock(runState, convId!, assistantMessage.id, {
+              id: uuid(),
+              phase: 'reflection',
+              content: `Completion check requested recovery (${integrity.attempt}).`,
+              timestamp: Date.now(),
+            })
+            continue
+          }
+          if (integrity.action === 'halt') {
+            diagnosticsStatus = 'halted'
+            diagnosticsReason = 'loop_guard_halt'
+            runState.content = integrity.message
+            addBlock(runState, convId!, assistantMessage.id, {
+              id: uuid(),
+              phase: 'reflection',
+              content: 'Completion check halted an unverified success claim.',
+              timestamp: Date.now(),
+            })
+            scheduleUIUpdate()
+            break
+          }
           // G16: ending the run is only legitimate when the model's own plan
           // is done. A read-only turn answers in text and is exempt. The
           // steer goes through agentMessages (NOT `messages`, see the
@@ -2665,6 +2694,7 @@ export function useAgentChat() {
         })
 
         runDiagnostics.recordExecutionResults(results)
+        completionIntegrity.recordExecutionResults(results)
 
         // Apply results back onto blocks + memory + LLM history.
         for (const entry of batch) {
