@@ -15,7 +15,9 @@ describe('shared context calibration recorder wiring', () => {
       expect(source).toContain("import { recordContextCalibration } from '../lib/context-calibration-recorder'")
       expect(source).toContain('const contextMeasurement = measureLogicalModelRequest({')
       expect(source).toContain('const recordCalibration = (actualPromptUnits?: number) => {')
-      expect(source).toContain('...recordContextCalibration({')
+      expect(source).toContain('const calibration = recordContextCalibration({')
+      expect(source).toContain('runDiagnostics.recordCalibration(calibration)')
+      expect(source).toContain('...calibration,')
     }
   })
 

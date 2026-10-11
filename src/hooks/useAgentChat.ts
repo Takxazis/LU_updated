@@ -46,6 +46,7 @@ import { buildVisionFeedback } from '../api/vision-feedback'
 import { getModelMaxTokens, estimateTokens } from '../lib/context-compaction'
 import { measureLogicalModelRequest } from '../lib/model-request-measurement'
 import { recordContextCalibration } from '../lib/context-calibration-recorder'
+import { createAgentRunDiagnostics } from '../lib/agent-run-diagnostics'
 import { buildRequestMessages, trimWorkingHistory } from '../lib/context-decay'
 import { effectiveSendWindow } from '../lib/send-window'
 import { toolCatalogUnits } from '../lib/tool-catalog-budget'
@@ -1327,6 +1328,13 @@ export function useAgentChat() {
 
     // Step number for the decay audit trail. The loop is a while, so it has
     // no index of its own.
+    const runDiagnostics = createAgentRunDiagnostics({
+      surface: 'agent',
+      provider: providerId,
+      model: modelToUse,
+      transport: strategy === 'native' ? 'native' : 'hermes_xml',
+      conversationId: convId,
+    })
     let stepNo = 0
     try {
       // ── Agent Loop ──────────────────────────────────────────
@@ -1337,6 +1345,7 @@ export function useAgentChat() {
       // is the whole condition.
       while (!abort.signal.aborted) {
         stepNo++
+        runDiagnostics.recordIteration()
         // Fertige Hintergrundagenten melden sich hier, oben in der Iteration:
         // vor dem Modellaufruf und nach den Werkzeugantworten der vorigen
         // Runde. Als NUTZER-Material — die Begruendung steht in
@@ -1575,6 +1584,7 @@ export function useAgentChat() {
           nativeToolUnits,
         })
         const historyAllowance = budgetPolicy.calibratedHistoryAllowance
+        runDiagnostics.recordPolicy(budgetPolicy)
         log.warn('agent.context_budget_policy', {
           event: 'agent_context_budget_policy',
           conversation_id: convId!,
@@ -1599,6 +1609,12 @@ export function useAgentChat() {
           })
           sendMessages = built.messages
           trimmedReadKeys = new Set(built.trimmedKeys)
+          runDiagnostics.recordCompaction({
+            trimmedResults: built.trimmedCount,
+            savedChars: built.savedChars,
+            prunedPlans: built.prunedPlans,
+            droppedImages: built.droppedImages,
+          })
           if (convId) {
             useSendSizeStore.getState().report(convId, {
               tokens: built.promptTokens,
@@ -1666,19 +1682,22 @@ export function useAgentChat() {
           modelContextLimit: agentCtx,
           effectiveSendWindow: sendWindow,
         })
+        runDiagnostics.recordRequestMeasurement(contextMeasurement)
         log.warn('agent.context_measurement', { ...contextMeasurement })
         const recordCalibration = (actualPromptUnits?: number) => {
           if (!actualPromptUnits) return
+          const calibration = recordContextCalibration({
+            provider: providerId,
+            model: modelToUse,
+            transport: strategy === 'native' ? 'native' : 'hermes_xml',
+            estimatedPromptUnits: contextMeasurement.estimated_total_units,
+            actualPromptUnits,
+          })
+          runDiagnostics.recordCalibration(calibration)
           log.warn('agent.context_calibration', {
             conversation_id: convId!,
             step: stepNo,
-            ...recordContextCalibration({
-              provider: providerId,
-              model: modelToUse,
-              transport: strategy === 'native' ? 'native' : 'hermes_xml',
-              estimatedPromptUnits: contextMeasurement.estimated_total_units,
-              actualPromptUnits,
-            }),
+            ...calibration,
           })
         }
 
@@ -2642,7 +2661,9 @@ export function useAgentChat() {
           const result = results.find((r) => r.id === entry.ac.id)
           if (!result) continue
           applyResultToToolCall(entry.ac, result)
-          // Over-loop accounting (David 2026-06-04): remember every executed call
+          runDiagnostics.recordExecutionResults(results)
+
+        // Over-loop accounting (David 2026-06-04): remember every executed call
           // (so an identical repeat is skipped) and count successful media gens
           // against the per-turn cap that stops "13× the same cat".
           executedCallKeys.add(callKey(entry.tc))

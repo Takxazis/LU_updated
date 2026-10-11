@@ -83,6 +83,7 @@ import { toolCatalogUnits } from '../lib/tool-catalog-budget'
 import { contextBudgetPolicy } from '../lib/context-budget-policy'
 import { measureLogicalModelRequest } from '../lib/model-request-measurement'
 import { recordContextCalibration } from '../lib/context-calibration-recorder'
+import { createAgentRunDiagnostics } from '../lib/agent-run-diagnostics'
 import { sendsToALanBackend } from '../lib/lan-openai-slot'
 import { useSendSizeStore } from '../stores/sendSizeStore'
 import { resolveAgentNumCtx } from '../lib/agent-num-ctx'
@@ -1090,6 +1091,14 @@ export function useCodex() {
       modelToUse, providerId, settings.contextWindowOverride, activeModel,
     )
 
+    const runDiagnostics = createAgentRunDiagnostics({
+      surface: 'codex',
+      provider: providerId,
+      model: modelToUse,
+      transport: strategy === 'native' ? 'native' : 'hermes_xml',
+      conversationId: convId,
+    })
+
     try {
       // Agent loop — max 20 iterations (legacy cap) AND AgentBudget cap,
       // whichever is tighter.
@@ -1151,6 +1160,7 @@ export function useCodex() {
       // backstop. Floor of 1 so a stray 0 setting can't zero the loop.
       const MAX_CODEX_ITERATIONS = Math.max(settings.agentMaxIterations ?? 200, 1)
       for (let i = 0; i < MAX_CODEX_ITERATIONS && !abort.signal.aborted && !isRunStopped(convId); i++) {
+        runDiagnostics.recordIteration()
         // Fertige Hintergrundagenten melden sich hier, oben in der Iteration:
         // vor dem Modellaufruf und nach den Werkzeugantworten der vorigen
         // Runde. Als NUTZER-Material — die Begruendung steht in
@@ -1352,6 +1362,7 @@ export function useCodex() {
           nativeToolUnits,
         })
         const historyAllowance = budgetPolicy.calibratedHistoryAllowance
+        runDiagnostics.recordPolicy(budgetPolicy)
         log.warn('codex.context_budget_policy', {
           event: 'codex_context_budget_policy',
           conversation_id: convId!,
@@ -1376,6 +1387,12 @@ export function useCodex() {
           })
           sendMessages = built.messages
           trimmedReadKeys = new Set(built.trimmedKeys)
+          runDiagnostics.recordCompaction({
+            trimmedResults: built.trimmedCount,
+            savedChars: built.savedChars,
+            prunedPlans: built.prunedPlans,
+            droppedImages: built.droppedImages,
+          })
           if (convId) {
             useSendSizeStore.getState().report(convId, {
               tokens: built.promptTokens,
@@ -1451,19 +1468,22 @@ export function useCodex() {
           modelContextLimit: numCtx,
           effectiveSendWindow: sendWindow,
         })
+        runDiagnostics.recordRequestMeasurement(contextMeasurement)
         log.warn('codex.context_measurement', { ...contextMeasurement })
         const recordCalibration = (actualPromptUnits?: number) => {
           if (!actualPromptUnits) return
+          const calibration = recordContextCalibration({
+            provider: providerId,
+            model: modelToUse,
+            transport: strategy === 'native' ? 'native' : 'hermes_xml',
+            estimatedPromptUnits: contextMeasurement.estimated_total_units,
+            actualPromptUnits,
+          })
+          runDiagnostics.recordCalibration(calibration)
           log.warn('codex.context_calibration', {
             conversation_id: convId!,
             step: i + 1,
-            ...recordContextCalibration({
-              provider: providerId,
-              model: modelToUse,
-              transport: strategy === 'native' ? 'native' : 'hermes_xml',
-              estimatedPromptUnits: contextMeasurement.estimated_total_units,
-              actualPromptUnits,
-            }),
+            ...calibration,
           })
         }
 
@@ -2251,6 +2271,7 @@ export function useCodex() {
           abortSignal: abort.signal,
         })
 
+        runDiagnostics.recordExecutionResults(results)
         void diagLog('executeParallel-done', {
           iter: i,
           results: results.map(r => ({ tool: r.toolName, status: r.status, error: r.error?.slice(0,200), hint: r.errorHint?.slice(0,200), resultHead: r.result?.slice(0,200) })),
